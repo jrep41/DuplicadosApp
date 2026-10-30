@@ -1,0 +1,28 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>DuplicadosApp</RootNamespace>
+    <AssemblyName>DuplicadosApp</AssemblyName>
+  </PropertyGroup>
+
+  <!--
+    El árbol de trabajo contiene material que NO forma parte del proyecto: la salida
+    de compilación (bin/, obj/), el código decompilado de referencia (decompiled/) y
+    las herramientas locales (.rea-tools/). El SDK incluye por defecto todos los
+    archivos .cs y .xaml que cuelgan de la carpeta del .csproj, así que sin estas
+    exclusiones cada tipo quedaría definido dos veces (CS0101) y habría dos
+    AssemblyInfo (CS0579), impidiendo compilar.
+  -->
+  <ItemGroup>
+    <Compile Remove="bin/**;obj/**;decompiled/**;.rea-tools/**;.vs/**" />
+    <Page Remove="bin/**;obj/**;decompiled/**;.rea-tools/**;.vs/**" />
+    <None Remove="bin/**;obj/**;decompiled/**;.rea-tools/**;.vs/**" />
+    <ApplicationDefinition Remove="decompiled/**" />
+  </ItemGroup>
+
+</Project>

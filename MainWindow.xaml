@@ -1,0 +1,434 @@
+<Window x:Class="DuplicadosApp.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:conv="clr-namespace:DuplicadosApp.Converters"
+        Title="Buscador de Archivos Duplicados"
+        Height="760" Width="1000" MinHeight="560" MinWidth="820"
+        WindowStartupLocation="CenterScreen"
+        FontFamily="{StaticResource AppFontFamily}"
+        FontSize="{StaticResource FontSizeBody}"
+        Foreground="{DynamicResource TextPrimaryBrush}"
+        Background="{DynamicResource WindowBackgroundBrush}"
+        UseLayoutRounding="True"
+        TextOptions.TextFormattingMode="Display">
+
+    <Window.Resources>
+        <ResourceDictionary>
+            <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+            <conv:InverseBooleanConverter x:Key="InverseBoolean" />
+            <conv:InverseBooleanToVisibilityConverter x:Key="InverseBoolToVisibility" />
+
+            <!--
+                Contenedor de una fila de archivo. Es un estilo IMPLÍCITO (sin x:Key)
+                para ListViewItem: aplicarlo por clave a un ItemsControl falla, porque
+                ese control genera ContentPresenter y no ListViewItem.
+            -->
+            <Style TargetType="ListViewItem">
+                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                <Setter Property="Padding" Value="2,1" />
+                <Setter Property="Focusable" Value="False" />
+                <Setter Property="Background" Value="Transparent" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="ListViewItem">
+                            <Border x:Name="Row"
+                                    Background="{TemplateBinding Background}"
+                                    CornerRadius="4"
+                                    Padding="{TemplateBinding Padding}">
+                                <ContentPresenter />
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="Row" Property="Background" Value="{DynamicResource SurfaceHoverBrush}" />
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <!--
+                Estilo IMPLÍCITO para todos los ToolTip de la ventana: limita el ancho
+                y ajusta el texto en varias líneas, de modo que ningún tooltip (de
+                botones o checkboxes) sobresalga del ancho que ocupa la aplicación.
+            -->
+            <Style TargetType="ToolTip">
+                <Setter Property="MaxWidth" Value="380" />
+                <Setter Property="ContentTemplate">
+                    <Setter.Value>
+                        <DataTemplate>
+                            <TextBlock Text="{Binding}" TextWrapping="Wrap" MaxWidth="360" />
+                        </DataTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+        </ResourceDictionary>
+    </Window.Resources>
+
+    <Grid Margin="14">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- Panel superior: selección de carpeta y opciones -->
+        <Border Grid.Row="0"
+                Background="{DynamicResource SurfaceBrush}"
+                BorderBrush="{DynamicResource BorderBrush}"
+                BorderThickness="1"
+                CornerRadius="8"
+                Padding="14,12"
+                Margin="0,0,0,10">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <StackPanel Grid.Row="0" Orientation="Horizontal">
+                    <Button Command="{Binding SelectFolderCommand}"
+                            Style="{StaticResource ActionButton}"
+                            HorizontalContentAlignment="Center"
+                            ToolTip="Abre un diálogo para elegir la carpeta que se analizará en busca de archivos duplicados.">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="{StaticResource IconFolder}"
+                                       FontFamily="{StaticResource IconFontFamily}"
+                                       FontSize="15"
+                                       Margin="0,0,8,0"
+                                       VerticalAlignment="Center" />
+                            <TextBlock Text="Seleccionar carpeta" VerticalAlignment="Center" />
+                        </StackPanel>
+                    </Button>
+                    <TextBlock Text="{Binding FolderPath}"
+                               VerticalAlignment="Center"
+                               Margin="10,0,0,0"
+                               FontSize="{StaticResource FontSizeBody}"
+                               Foreground="{DynamicResource AccentBrush}"
+                               TextTrimming="CharacterEllipsis"
+                               ToolTip="{Binding FolderPath}"
+                               MaxWidth="620" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,12,0,0">
+                    <CheckBox Content="Comparar byte a byte (desmarcado: nombre y tamaño)"
+                              Style="{StaticResource AppCheckBox}"
+                              IsChecked="{Binding CompareByteByByte}"
+                              IsEnabled="{Binding IsIdle}"
+                              VerticalAlignment="Center"
+                              ToolTip="Al marcar, compara el contenido de los archivos byte a byte para confirmar que son idénticos (más preciso pero más lento). Al desmarcar, solo compara el nombre y el tamaño."
+                              ToolTipService.ShowOnDisabled="True" />
+                    <CheckBox Content="Modo detallado"
+                              Style="{StaticResource AppCheckBox}"
+                              IsChecked="{Binding Verbose}"
+                              Margin="26,0,0,0"
+                              VerticalAlignment="Center"
+                              ToolTip="Al marcar, escribe información detallada del proceso y el latido de estado en el registro de actividad. Al desmarcar, pausa la escritura de nuevas líneas en el registro." />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- Barra de progreso -->
+        <Grid Grid.Row="1" Margin="0,0,0,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <ProgressBar Grid.Column="0"
+                         Style="{StaticResource AppProgressBar}"
+                         VerticalAlignment="Center"
+                         Minimum="0" Maximum="100"
+                         IsIndeterminate="{Binding IsProgressIndeterminate}"
+                         Value="{Binding ProgressValue, Mode=OneWay}" />
+            <TextBlock Grid.Column="1" Text="{Binding ProgressText}"
+                       Margin="12,0,0,0"
+                       VerticalAlignment="Center"
+                       MinWidth="260" TextAlignment="Right"
+                       Style="{StaticResource SecondaryText}" />
+        </Grid>
+
+        <!-- Estado -->
+        <TextBlock Grid.Row="2" Text="{Binding StatusText}"
+                   Margin="3,0,0,10"
+                   TextWrapping="Wrap"
+                   Style="{StaticResource SecondaryText}" />
+
+        <!-- Resultados -->
+        <Border Grid.Row="3"
+                Background="{DynamicResource SurfaceBrush}"
+                BorderBrush="{DynamicResource BorderBrush}"
+                BorderThickness="1"
+                CornerRadius="8"
+                Padding="4">
+            <Grid>
+                <!--
+                    ListView virtualizada: los contenedores se crean solo para lo que
+                    se ve. El encabezado de cada grupo lo dibuja la propia lista, así
+                    que no hay un panel por grupo ni todos los elementos a la vez.
+                -->
+                <ListView x:Name="ResultadosLista"
+                          ItemsSource="{Binding GroupedResults}"
+                          Background="Transparent"
+                          BorderThickness="0"
+                          Padding="6"
+                          SelectionMode="Single"
+                          IsSynchronizedWithCurrentItem="False"
+                          ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                          ScrollViewer.VerticalScrollBarVisibility="Auto"
+                          ScrollViewer.CanContentScroll="True"
+                          VirtualizingPanel.IsVirtualizing="True"
+                          VirtualizingPanel.VirtualizationMode="Recycling"
+                          VirtualizingPanel.IsVirtualizingWhenGrouping="True">
+                    <ListView.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <VirtualizingStackPanel />
+                        </ItemsPanelTemplate>
+                    </ListView.ItemsPanel>
+                    <ListView.ItemContainerStyle>
+                        <Style TargetType="ListViewItem">
+                            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                            <Setter Property="Padding" Value="0" />
+                            <Setter Property="Margin" Value="0,0,0,10" />
+                            <Setter Property="Focusable" Value="False" />
+                            <Setter Property="Template">
+                                <Setter.Value>
+                                    <ControlTemplate TargetType="ListViewItem">
+                                        <ContentPresenter />
+                                    </ControlTemplate>
+                                </Setter.Value>
+                            </Setter>
+                        </Style>
+                    </ListView.ItemContainerStyle>
+                    <ListView.GroupStyle>
+                        <GroupStyle>
+                            <GroupStyle.HeaderTemplate>
+                                <DataTemplate>
+                                    <StackPanel Margin="2,0,2,6">
+                                        <TextBlock Text="{Binding Name.Header}"
+                                                   Style="{StaticResource TitleText}" />
+                                        <TextBlock Text="{Binding Name.Summary}"
+                                                   Style="{StaticResource CaptionText}"
+                                                   Margin="0,3,0,0" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </GroupStyle.HeaderTemplate>
+                            <GroupStyle.Panel>
+                                <ItemsPanelTemplate>
+                                    <VirtualizingStackPanel />
+                                </ItemsPanelTemplate>
+                            </GroupStyle.Panel>
+                        </GroupStyle>
+                    </ListView.GroupStyle>
+                    <ListView.ItemTemplate>
+                        <DataTemplate>
+                            <Border Background="{DynamicResource SurfaceAltBrush}"
+                                    BorderBrush="{DynamicResource BorderBrush}"
+                                    BorderThickness="1"
+                                    CornerRadius="6"
+                                    Padding="10,6">
+                                <!--
+                                    MaxHeight acota la altura cuando un mismo grupo tiene
+                                    cientos o miles de archivos idénticos, permitiendo que
+                                    VirtualizingStackPanel recicle las filas en lugar de
+                                    instanciar todos los controles de golpe.
+                                -->
+                                <ListView ItemsSource="{Binding Files}"
+                                          MaxHeight="260"
+                                          Background="Transparent"
+                                          BorderThickness="0"
+                                          Padding="0"
+                                          SelectionMode="Single"
+                                          IsSynchronizedWithCurrentItem="False"
+                                          ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                          ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                          ScrollViewer.CanContentScroll="True"
+                                          VirtualizingPanel.IsVirtualizing="True"
+                                          VirtualizingPanel.VirtualizationMode="Recycling">
+                                    <ListView.ItemsPanel>
+                                        <ItemsPanelTemplate>
+                                            <VirtualizingStackPanel />
+                                        </ItemsPanelTemplate>
+                                    </ListView.ItemsPanel>
+                                    <ListView.ItemTemplate>
+                                        <DataTemplate>
+                                            <Grid Margin="0,2">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto" />
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                </Grid.ColumnDefinitions>
+                                                <CheckBox Grid.Column="0"
+                                                          Style="{StaticResource AppCheckBox}"
+                                                          IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                                          VerticalAlignment="Center"
+                                                          ToolTip="Al marcar, selecciona este archivo para eliminarlo (se envía a la Papelera al pulsar «Eliminar archivos seleccionados»). Al desmarcar, el archivo no se elimina." />
+                                                <TextBlock Grid.Column="1"
+                                                           Text="{Binding Path}"
+                                                           Margin="8,0,10,0"
+                                                           TextWrapping="Wrap"
+                                                           ToolTip="{Binding Path}" />
+                                                <TextBlock Grid.Column="2"
+                                                           Text="{Binding SizeText}"
+                                                           VerticalAlignment="Center"
+                                                           Margin="0,0,4,0"
+                                                           Style="{StaticResource MutedText}" />
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ListView.ItemTemplate>
+                                </ListView>
+                            </Border>
+                        </DataTemplate>
+                    </ListView.ItemTemplate>
+                </ListView>
+
+                <TextBlock Text="Selecciona una carpeta y pulsa «Buscar duplicados»."
+                           Style="{StaticResource MutedText}"
+                           FontSize="{StaticResource FontSizeBody}"
+                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           Visibility="{Binding HasResults, Converter={StaticResource InverseBoolToVisibility}}" />
+            </Grid>
+        </Border>
+
+        <!-- Actividad -->
+        <GroupBox Grid.Row="4" Header="Actividad" Margin="0,10,0,0"
+                  Padding="6,4"
+                  FontFamily="{StaticResource AppFontFamily}"
+                  Foreground="{DynamicResource TextSecondaryBrush}">
+            <DockPanel LastChildFill="True">
+                <!--
+                    Barra de progreso de la ACCIÓN en curso: se reutiliza y cambia según
+                    la fase activa (recorrido, agrupado por tamaño, comparación,
+                    verificación, envío a la papelera…). Se distingue de la barra global
+                    de arriba, que mide el avance total de la operación.
+                -->
+                <Grid DockPanel.Dock="Top" Margin="4,2,4,6">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <ProgressBar Grid.Column="0"
+                                 Style="{StaticResource AppProgressBar}"
+                                 Height="6"
+                                 VerticalAlignment="Center"
+                                 Minimum="0" Maximum="100"
+                                 IsIndeterminate="{Binding IsPhaseIndeterminate}"
+                                 Value="{Binding PhaseValue, Mode=OneWay}" />
+                    <TextBlock Grid.Column="1"
+                               Text="{Binding PhaseLabel}"
+                               Margin="10,0,0,0"
+                               VerticalAlignment="Center"
+                               MinWidth="220" TextAlignment="Right"
+                               Style="{StaticResource CaptionText}" />
+                </Grid>
+
+                <!--
+                    RichTextBox (no TextBox) porque cada línea lleva su propio color.
+                    Sin binding de Text: la vista AÑADE cada línea al final desde el código
+                    (ver MainWindow.xaml.cs). Antes se reconstruía todo el texto en cada
+                    línea, y el coste crecía con el número de líneas.
+                -->
+                <RichTextBox x:Name="RegistroTexto"
+                             IsReadOnly="True"
+                             Height="110"
+                             FontFamily="{StaticResource MonoFontFamily}"
+                             FontSize="11"
+                             BorderThickness="0"
+                             Padding="4"
+                             Foreground="{DynamicResource TextPrimaryBrush}"
+                             VerticalScrollBarVisibility="Auto"
+                             HorizontalScrollBarVisibility="Auto"
+                             Background="{DynamicResource SurfaceAltBrush}" />
+            </DockPanel>
+        </GroupBox>
+
+        <!-- Acciones -->
+        <Grid Grid.Row="5" Margin="0,12,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <Button Grid.Column="0"
+                    Command="{Binding StartSearchCommand}"
+                    Style="{StaticResource ActionButton}"
+                    HorizontalContentAlignment="Center"
+                    ToolTip="Inicia el análisis de la carpeta seleccionada y muestra los grupos de archivos duplicados.">
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="{StaticResource IconSearch}"
+                               FontFamily="{StaticResource IconFontFamily}"
+                               FontSize="15"
+                               Margin="0,0,8,0"
+                               VerticalAlignment="Center" />
+                    <TextBlock Text="Buscar duplicados" VerticalAlignment="Center" />
+                </StackPanel>
+            </Button>
+
+            <Button Grid.Column="1" Content="Seleccionar copias (automático)"
+                    Command="{Binding SelectCopiesCommand}"
+                    Style="{StaticResource ActionButton}"
+                    HorizontalContentAlignment="Center"
+                    ToolTip="Marca automáticamente los archivos sobrantes de cada grupo (conserva una sola copia) para poder eliminarlos." />
+            <Button Grid.Column="2" Content="Quitar selección"
+                    Command="{Binding ClearSelectionCommand}"
+                    Style="{StaticResource ActionButton}"
+                    HorizontalContentAlignment="Center"
+                    ToolTip="Desmarca todos los archivos seleccionados y deja el resumen de selección a cero." />
+            <Button Grid.Column="3" Content="{Binding PauseButtonText}"
+                    Command="{Binding TogglePauseCommand}"
+                    Style="{StaticResource ActionButton}"
+                    HorizontalContentAlignment="Center"
+                    Margin="0"
+                    ToolTip="Pausa o reanuda el análisis en curso sin perder el progreso." />
+
+            <TextBlock Grid.Column="4" Text="{Binding SelectionSummary}"
+                       VerticalAlignment="Center" Margin="14,0"
+                       Style="{StaticResource SecondaryText}" />
+
+            <StackPanel Grid.Column="5" Orientation="Horizontal">
+                <Button Content="Cancelar"
+                        Command="{Binding CancelCommand}"
+                        Style="{StaticResource ActionButton}"
+                        HorizontalContentAlignment="Center"
+                        Visibility="{Binding IsBusy, Converter={StaticResource BoolToVisibility}}"
+                        ToolTip="Detiene de inmediato la operación en curso (si es una búsqueda, devuelve la ventana a su estado inicial; si es un borrado, detiene el envío a la papelera)." />
+                <Button Command="{Binding DeleteSelectedCommand}"
+                        Style="{StaticResource DangerButton}"
+                        ToolTip="Envía a la Papelera todos los archivos marcados con la casilla de selección.">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="{StaticResource IconTrash}"
+                                   FontFamily="{StaticResource IconFontFamily}"
+                                   FontSize="15"
+                                   Margin="0,0,8,0"
+                                   VerticalAlignment="Center" />
+                        <TextBlock Text="Eliminar archivos seleccionados" VerticalAlignment="Center" />
+                    </StackPanel>
+                </Button>
+            </StackPanel>
+        </Grid>
+
+        <!-- Papelera propia: se usa cuando la del sistema no está disponible -->
+        <Grid Grid.Row="6" Margin="0,8,0,0">
+            <Button HorizontalAlignment="Left"
+                    Command="{Binding AbrirPapeleraPropiaCommand}"
+                    Style="{StaticResource SecondaryButton}"
+                    ToolTip="Abre la carpeta donde la aplicación guarda los archivos eliminados cuando la Papelera de Windows no está disponible.">
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="{StaticResource IconFolder}"
+                               FontFamily="{StaticResource IconFontFamily}"
+                               FontSize="14"
+                               Margin="0,0,7,0"
+                               VerticalAlignment="Center" />
+                    <TextBlock Text="Abrir papelera de la aplicación" VerticalAlignment="Center" />
+                </StackPanel>
+            </Button>
+        </Grid>
+    </Grid>
+</Window>

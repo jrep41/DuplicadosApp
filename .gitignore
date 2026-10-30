@@ -1,0 +1,32 @@
+# --- .NET / WPF ---
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+
+# --- Artefactos de compilación publicados ---
+publish/
+*.pdb
+*.dll
+*.exe
+!*.deps.json
+!*.runtimeconfig.json
+
+# --- Material decompilado de referencia (se conserva fuera del control de versiones) ---
+decompiled/
+*decompilado.zip
+
+# --- Herramientas locales de análisis ---
+.rea-tools/
+
+# --- Sistema operativo ---
+Thumbs.db
+desktop.ini
+.DS_Store
