@@ -1,7 +1,48 @@
 namespace DuplicadosApp.Models;
 
-/// <summary>Archivo encontrado durante el escaneo, con su tamaño e identidad de volumen.</summary>
-public sealed record FileEntry(string Path, long Size, FileIdentity Identity);
+/// <summary>Archivo encontrado durante el escaneo, con su tamaño, fecha e identidad de volumen.</summary>
+public sealed record FileEntry(
+    string Path,
+    long Size,
+    FileIdentity Identity,
+    DateTime LastWriteTimeUtc = default);
+
+/// <summary>Opciones configurables del escaneo de duplicados.</summary>
+public sealed record ScanOptions
+{
+    /// <summary>Tamaño mínimo en bytes para considerar un archivo (1 = ignora archivos vacíos de 0 B).</summary>
+    public long MinFileSizeBytes { get; init; } = 1;
+
+    /// <summary>Exige la misma extensión (sin distinguir mayúsculas) antes de comparar contenidos.</summary>
+    public bool RequireSameExtension { get; init; } = true;
+
+    /// <summary>Omite archivos y carpetas marcados como ocultos o de sistema.</summary>
+    public bool IgnoreHiddenAndSystem { get; init; }
+
+    /// <summary>Omite archivos solo en la nube (OneDrive Files On-Demand) para evitar descargas inesperadas.</summary>
+    public bool SkipCloudOnlyFiles { get; init; } = true;
+
+    /// <summary>Opciones predeterminadas recomendadas.</summary>
+    public static ScanOptions Default { get; } = new();
+}
+
+/// <summary>Criterio de ordenación para los grupos de resultados.</summary>
+public enum SortOption
+{
+    RecoverableSpaceDesc,
+    FileSizeDesc,
+    FileCountDesc,
+    NameAsc,
+}
+
+/// <summary>Estrategia automática para elegir qué copia conservar en cada grupo.</summary>
+public enum SelectionStrategy
+{
+    KeepOldest,
+    KeepNewest,
+    KeepShortestPath,
+    KeepFirst,
+}
 
 /// <summary>Grupo de archivos considerados duplicados entre sí.</summary>
 public sealed class DuplicateGroup
@@ -12,6 +53,9 @@ public sealed class DuplicateGroup
     public required string DisplayName { get; init; }
 
     public required IReadOnlyList<FileEntry> Files { get; set; }
+
+    /// <summary>Espacio en bytes que se liberaría eliminando todas las copias menos una.</summary>
+    public long RecoverableBytes => Files.Count > 1 ? Size * (Files.Count - 1) : 0;
 }
 
 /// <summary>
@@ -30,6 +74,16 @@ public sealed class ScanResult
     public List<DuplicateGroup> Groups { get; } = [];
 
     public int Errors { get; set; }
+
+    public int TotalFilesScanned { get; set; }
+
+    public int TotalFoldersScanned { get; set; }
+
+    public int SkippedHardLinks { get; set; }
+
+    public int SkippedCloudFiles { get; set; }
+
+    public TimeSpan Elapsed { get; set; }
 
     public string GeneralError { get; set; } = string.Empty;
 
@@ -57,8 +111,9 @@ public enum DeleteDestination
 /// Datos que la vista necesita para redactar la confirmación de un borrado.
 /// </summary>
 /// <param name="Count">Archivos que se van a enviar a la papelera.</param>
+/// <param name="Bytes">Bytes totales a liberar.</param>
 /// <param name="GroupsKept">Grupos en los que se marcaron todas las copias y se conserva una.</param>
-public sealed record DeletePrompt(int Count, int GroupsKept);
+public sealed record DeletePrompt(int Count, long Bytes, int GroupsKept);
 
 /// <summary>Resultado de un borrado.</summary>
 public sealed class DeleteOutcome

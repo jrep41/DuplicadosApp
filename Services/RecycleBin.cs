@@ -1,4 +1,7 @@
+using System.Buffers;
+using System.Collections.Concurrent;
 using System.IO;
+using System.IO.Enumeration;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
@@ -9,11 +12,11 @@ namespace DuplicadosApp.Services;
 /// Envía archivos a la Papelera de reciclaje en lugar de borrarlos para siempre, y
 /// comprueba que de verdad llegaron allí.
 ///
-/// Por qué se comprueba: <c>SHFileOperation</c>/<c>IFileOperation</c> devuelven éxito
-/// aunque Windows acabe borrando el archivo para siempre. Ocurre, por ejemplo, dentro
-/// de un AppContainer (procesos enjaulados): el shell no puede escribir en la Papelera
-/// y aplica un borrado permanente sin avisar. El resultado se verifica y, si el
-/// archivo no aparece en la Papelera, se considera un error para no destruir nada.
+/// Mejoras clave:
+/// - Ejecuta <c>IFileOperation</c> en un hilo STA dedicado (requisito COM del shell de Windows).
+/// - Mantiene caché de disponibilidad por volumen (evita confundir unidades con y sin Papelera).
+/// - Usa sesiones de reciclado con registro de metadatos ($I) ya inspeccionados para
+///   verificar cada envío en tiempo O(1) incluso con miles de archivos en la Papelera.
 /// </summary>
 internal static class RecycleBin
 {
@@ -28,9 +31,10 @@ internal static class RecycleBin
     /// <summary>SID del usuario actual en caché para evitar fugas de handles nativos en cada consulta.</summary>
     private static readonly string? UserSid = ObtenerSidUsuarioActual();
 
-    private static bool? _disponible;
-    private static string? _ubicacionSondeada;
-    private static readonly Lock _candado = new();
+    private static readonly Dictionary<string, bool> DisponibilidadPorVolumen = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Lock Candado = new();
+
+    private static readonly TimeSpan MargenDeFecha = TimeSpan.FromSeconds(15);
 
     private static string? ObtenerSidUsuarioActual()
     {
@@ -46,52 +50,57 @@ internal static class RecycleBin
     }
 
     /// <summary>
-    /// Margen que se resta al inicio de la operación al filtrar los metadatos ($I) de la
-    /// Papelera. Cubre el redondeo de la fecha de escritura en NTFS (resolución ~2 s) y
-    /// el desfase con el reloj del sistema.
-    /// </summary>
-    private static readonly TimeSpan MargenDeFecha = TimeSpan.FromSeconds(15);
-
-    /// <summary>
-    /// Comprueba si este entorno puede reciclar de verdad: envía un archivo de sonda
-    /// a la Papelera y mira si aparece. El resultado se recuerda por ubicación.
+    /// Comprueba si el volumen de <paramref name="carpetaDeTrabajo"/> puede reciclar de verdad:
+    /// envía una sonda y comprueba que aparezca en la Papelera de ese volumen.
+    /// El resultado se recuerda por volumen para no mezclar discos locales con unidades USB/red.
     /// </summary>
     public static bool IsAvailable(string? carpetaDeTrabajo = null)
     {
-        var candidatas = new List<string>(2);
-        if (!string.IsNullOrWhiteSpace(carpetaDeTrabajo) && Directory.Exists(carpetaDeTrabajo))
+        var carpeta = !string.IsNullOrWhiteSpace(carpetaDeTrabajo) && Directory.Exists(carpetaDeTrabajo)
+            ? Path.GetFullPath(carpetaDeTrabajo)
+            : Path.GetFullPath(Path.GetTempPath());
+
+        var volumen = Path.GetPathRoot(carpeta);
+        if (string.IsNullOrEmpty(volumen))
         {
-            candidatas.Add(carpetaDeTrabajo);
+            return false;
         }
 
-        candidatas.Add(Path.GetTempPath());
-
-        lock (_candado)
+        lock (Candado)
         {
-            foreach (var candidata in candidatas)
+            if (DisponibilidadPorVolumen.TryGetValue(volumen, out var conocido))
             {
-                if (_disponible is { } conocido &&
-                    string.Equals(_ubicacionSondeada, candidata, StringComparison.OrdinalIgnoreCase))
-                {
-                    return conocido;
-                }
-
-                var resultado = Sondear(candidata);
-                if (resultado is null)
-                {
-                    continue;
-                }
-
-                _disponible = resultado;
-                _ubicacionSondeada = candidata;
-                return resultado.Value;
+                return conocido;
             }
 
-            return false;
+            var resultado = Sondear(carpeta);
+            if (resultado is null)
+            {
+                // Solo probamos Temp si está en el MISMO volumen; nunca asumimos disponibilidad de otro disco.
+                var temp = Path.GetFullPath(Path.GetTempPath());
+                if (string.Equals(Path.GetPathRoot(temp), volumen, StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(temp, carpeta, StringComparison.OrdinalIgnoreCase))
+                {
+                    resultado = Sondear(temp);
+                }
+            }
+
+            var disponible = resultado ?? false;
+            DisponibilidadPorVolumen[volumen] = disponible;
+            return disponible;
         }
     }
 
-    /// <summary>Sondea una carpeta concreta. Devuelve null si no se pudo ni escribir.</summary>
+    /// <summary>Abre una sesión optimizada (hilo STA persistente + verificación O(1)) para una tanda de borrado.</summary>
+    public static RecycleBinSession CreateSession() => new();
+
+    /// <summary>Envía un único archivo a la Papelera y verifica su llegada.</summary>
+    public static bool? MoveToRecycleBin(string path)
+    {
+        using var session = new RecycleBinSession();
+        return session.MoveToRecycleBin(path);
+    }
+
     private static bool? Sondear(string carpeta)
     {
         var sonda = Path.Combine(carpeta, $"duplicados-sonda-{Guid.NewGuid():N}.bin");
@@ -115,13 +124,12 @@ internal static class RecycleBin
 
             string? archivoMetadatos = null;
             var inicio = DateTime.UtcNow.Add(-MargenDeFecha);
-            var exito = EnviarAlShell(sonda)
-                        && BuscarMetadatosEnPapelera(sonda, inicio, out archivoMetadatos)
+            var enviado = EjecutarEnSta(() => EnviarAlShellEnHiloActual(sonda));
+            var exito = enviado
+                        && BuscarMetadatosEnPapelera(sonda, inicio, archivosConocidos: null, out archivoMetadatos)
                         && ContarEnLaPapelera(sonda) is { } despues
                         && despues > antes;
 
-            // Si la sonda llegó a la Papelera, se limpian sus archivos $I y $R para no
-            // dejar archivos residuales de prueba en la Papelera del usuario.
             if (exito && archivoMetadatos is not null)
             {
                 LimpiarSondaReciclada(archivoMetadatos);
@@ -144,12 +152,11 @@ internal static class RecycleBin
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                // Da igual: es un archivo temporal de 64 bytes.
+                // Archivo temporal de 64 bytes.
             }
         }
     }
 
-    /// <summary>Elimina silenciosamente el par $I/$R generado por la sonda en la Papelera.</summary>
     private static void LimpiarSondaReciclada(string rutaMetadatosI)
     {
         try
@@ -172,11 +179,10 @@ internal static class RecycleBin
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // Si no se puede limpiar la sonda de la Papelera, no afecta al funcionamiento.
+            // No afecta al funcionamiento.
         }
     }
 
-    /// <summary>Cuenta los elementos reciclados de la unidad del archivo dado.</summary>
     private static int? ContarEnLaPapelera(string rutaDeReferencia)
     {
         try
@@ -197,35 +203,26 @@ internal static class RecycleBin
         }
     }
 
-    /// <summary>
-    /// Mueve un archivo a la Papelera y comprueba si de verdad llegó allí.
-    /// </summary>
-    /// <returns>
-    /// <c>null</c> si el archivo no se movió (sigue en su ruta original o la operación
-    /// se abortó); <c>true</c> si se movió y se confirmó su presencia en la Papelera;
-    /// <c>false</c> si desapareció de su ruta pero no se pudo confirmar el destino. Este
-    /// último caso no es un fallo del borrado: el archivo ya no ocupa su sitio, solo que
-    /// no se puede afirmar que se pueda restaurar.
-    /// </returns>
-    public static bool? MoveToRecycleBin(string path)
+    private static bool EjecutarEnSta(Func<bool> accion)
     {
-        if (!File.Exists(path))
+        if (Thread.CurrentThread.GetApartmentState() == ApartmentState.STA)
         {
-            return null;
+            return accion();
         }
 
-        // Instante anterior al envío: acota qué metadatos ($I) pueden ser los de este archivo.
-        var inicio = DateTime.UtcNow.Add(-MargenDeFecha);
-
-        if (!EnviarAlShell(path))
+        var resultado = false;
+        var hilo = new Thread(() => resultado = accion())
         {
-            return null;
-        }
-
-        return BuscarMetadatosEnPapelera(path, inicio, out _);
+            IsBackground = true,
+            Name = "RecycleBin-STA-Probe",
+        };
+        hilo.SetApartmentState(ApartmentState.STA);
+        hilo.Start();
+        hilo.Join();
+        return resultado;
     }
 
-    private static bool EnviarAlShell(string path)
+    internal static bool EnviarAlShellEnHiloActual(string path)
     {
         IFileOperation? operacion = null;
         IShellItem? elemento = null;
@@ -265,21 +262,34 @@ internal static class RecycleBin
         }
     }
 
-    /// <summary>
-    /// Busca entre los metadatos ($I) de la Papelera de la unidad si alguno corresponde a
-    /// <paramref name="rutaOriginal"/>. Usa <see cref="DirectoryInfo.EnumerateFiles(string, SearchOption)"/>
-    /// para obtener las fechas de modificación directamente del listado de directorio sin
-    /// realizar una llamada al sistema adicional por cada archivo.
-    /// </summary>
-    /// <param name="inicio">
-    /// Si se indica, solo se examinan metadatos escritos a partir de ese instante. Acotar
-    /// por fecha, en lugar de quedarse con los N más recientes, evita falsos negativos
-    /// cuando se reciclan muchos archivos seguidos: el archivo recién reciclado siempre
-    /// cae dentro de la ventana, por grande que sea la tanda.
-    /// </param>
-    private static bool BuscarMetadatosEnPapelera(
+    internal static HashSet<string> CapturarMetadatosActuales(string papelera)
+    {
+        var conocidos = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            if (!Directory.Exists(papelera))
+            {
+                return conocidos;
+            }
+
+            using var enumerator = new MetadataFileEnumerator(papelera, DateTime.MinValue);
+            while (enumerator.MoveNext())
+            {
+                conocidos.Add(enumerator.Current.Name);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Se ignora; la verificación seguirá funcionando por ventana temporal.
+        }
+
+        return conocidos;
+    }
+
+    internal static bool BuscarMetadatosEnPapelera(
         string rutaOriginal,
-        DateTime? inicio,
+        DateTime inicio,
+        HashSet<string>? archivosConocidos,
         out string? rutaMetadatosEncontrada)
     {
         rutaMetadatosEncontrada = null;
@@ -292,37 +302,44 @@ internal static class RecycleBin
                 return false;
             }
 
-            var desde = inicio ?? DateTime.MinValue;
-            var dirInfo = new DirectoryInfo(papelera);
-
-            // Se ordena de más reciente a más antiguo DENTRO de la ventana temporal: el
-            // archivo que se acaba de reciclar es casi siempre el primero que se mira, así
-            // que el coste por archivo se queda en una lectura en lugar de recorrer toda la
-            // tanda anterior.
-            var metadatos = dirInfo
-                .EnumerateFiles("$I*", SearchOption.TopDirectoryOnly)
-                .Where(archivo => archivo.LastWriteTimeUtc >= desde)
-                .OrderByDescending(archivo => archivo.LastWriteTimeUtc);
-
-            foreach (var metadatosArchivo in metadatos)
+            var candidatos = new List<(string Name, DateTime LastWriteUtc)>(8);
+            using (var enumerator = new MetadataFileEnumerator(papelera, inicio))
             {
-                if (RutaOriginalDe(metadatosArchivo.FullName) is { } original &&
-                    string.Equals(original, rutaNormalizada, StringComparison.OrdinalIgnoreCase))
+                while (enumerator.MoveNext())
                 {
-                    rutaMetadatosEncontrada = metadatosArchivo.FullName;
+                    var item = enumerator.Current;
+                    if (archivosConocidos is not null && archivosConocidos.Contains(item.Name))
+                    {
+                        continue;
+                    }
+
+                    candidatos.Add(item);
+                }
+            }
+
+            candidatos.Sort(static (a, b) => b.LastWriteUtc.CompareTo(a.LastWriteUtc));
+
+            foreach (var (nombre, _) in candidatos)
+            {
+                var rutaCompletaI = Path.Combine(papelera, nombre);
+                if (RutaOriginalDe(rutaCompletaI) is { } original
+                    && string.Equals(original, rutaNormalizada, StringComparison.OrdinalIgnoreCase))
+                {
+                    archivosConocidos?.Add(nombre);
+                    rutaMetadatosEncontrada = rutaCompletaI;
                     return true;
                 }
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // Si no se puede comprobar, se devuelve false por seguridad.
+            // Por seguridad se devuelve false.
         }
 
         return false;
     }
 
-    private static string? ObtenerRutaPapelera(string rutaArchivo)
+    internal static string? ObtenerRutaPapelera(string rutaArchivo)
     {
         var raiz = Path.GetPathRoot(Path.GetFullPath(rutaArchivo));
         if (raiz is null || UserSid is null)
@@ -334,28 +351,46 @@ internal static class RecycleBin
     }
 
     /// <summary>
-    /// Lee la ruta original de un archivo de metadatos de la Papelera ($I).
-    /// Formato: 8 bytes de versión, 8 de tamaño, 8 de fecha y la ruta en UTF-16.
-    /// La versión 2 añade 4 bytes con la longitud en caracteres antes de la ruta.
+    /// Lee la ruta original de un archivo de metadatos ($I) usando un búfer alquilado
+    /// (evita asignaciones de arrays por cada archivo).
     /// </summary>
     private static string? RutaOriginalDe(string rutaMetadatos)
     {
+        var buffer = ArrayPool<byte>.Shared.Rent(1024);
         try
         {
-            var bytes = File.ReadAllBytes(rutaMetadatos);
-            if (bytes.Length < 28)
+            using var handle = File.OpenHandle(
+                rutaMetadatos,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+
+            var length = (int)Math.Min(RandomAccess.GetLength(handle), 4096);
+            if (length < 28)
             {
                 return null;
             }
 
-            var version = BitConverter.ToInt64(bytes, 0);
+            if (length > buffer.Length)
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+                buffer = ArrayPool<byte>.Shared.Rent(length);
+            }
+
+            var read = FileSystemService.ReadAt(handle, buffer.AsSpan(0, length), 0);
+            if (read < 28)
+            {
+                return null;
+            }
+
+            var version = BitConverter.ToInt64(buffer, 0);
             var inicio = version >= 2 ? 28 : 24;
-            if (inicio >= bytes.Length)
+            if (inicio >= read)
             {
                 return null;
             }
 
-            var texto = Encoding.Unicode.GetString(bytes, inicio, bytes.Length - inicio);
+            var texto = Encoding.Unicode.GetString(buffer, inicio, read - inicio);
             var fin = texto.IndexOf('\0');
             return fin >= 0 ? texto[..fin] : texto;
         }
@@ -363,12 +398,138 @@ internal static class RecycleBin
         {
             return null;
         }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
     }
 
     private static IFileOperation CrearOperacion()
     {
         var tipo = Type.GetTypeFromCLSID(ClsidFileOperation, throwOnError: true)!;
         return (IFileOperation)Activator.CreateInstance(tipo)!;
+    }
+
+    /// <summary>
+    /// Enumerador sin asignaciones de <c>FileInfo</c> para leer solo los archivos <c>$I*</c>
+    /// recientes de la Papelera.
+    /// </summary>
+    private sealed class MetadataFileEnumerator : FileSystemEnumerator<(string Name, DateTime LastWriteUtc)>
+    {
+        private readonly DateTime _minWriteUtc;
+
+        public MetadataFileEnumerator(string directory, DateTime minWriteUtc)
+            : base(directory, new EnumerationOptions
+            {
+                RecurseSubdirectories = false,
+                IgnoreInaccessible = true,
+                ReturnSpecialDirectories = false,
+                AttributesToSkip = 0,
+            })
+        {
+            _minWriteUtc = minWriteUtc;
+        }
+
+        protected override bool ShouldIncludeEntry(ref FileSystemEntry entry)
+        {
+            if (entry.IsDirectory)
+            {
+                return false;
+            }
+
+            var name = entry.FileName;
+            if (name.Length < 3 || name[0] != '$' || (name[1] != 'I' && name[1] != 'i'))
+            {
+                return false;
+            }
+
+            return entry.LastWriteTimeUtc.UtcDateTime >= _minWriteUtc;
+        }
+
+        protected override (string Name, DateTime LastWriteUtc) TransformEntry(ref FileSystemEntry entry)
+            => (entry.FileName.ToString(), entry.LastWriteTimeUtc.UtcDateTime);
+    }
+
+    /// <summary>
+    /// Sesión de reciclado con un único hilo STA y tabla de metadatos <c>$I*</c> ya vistos
+    /// por volumen para acelerar borrados de cientos o miles de archivos.
+    /// </summary>
+    internal sealed class RecycleBinSession : IDisposable
+    {
+        private readonly BlockingCollection<(string Path, TaskCompletionSource<bool> Result)> _queue = new();
+        private readonly Dictionary<string, HashSet<string>> _conocidosPorPapelera = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Thread _staThread;
+        private bool _disposed;
+
+        public RecycleBinSession()
+        {
+            _staThread = new Thread(ProcessQueue)
+            {
+                IsBackground = true,
+                Name = "RecycleBin-STA-Worker",
+            };
+            _staThread.SetApartmentState(ApartmentState.STA);
+            _staThread.Start();
+        }
+
+        public bool? MoveToRecycleBin(string path)
+        {
+            if (_disposed || !File.Exists(path))
+            {
+                return null;
+            }
+
+            var papelera = ObtenerRutaPapelera(path);
+            HashSet<string>? conocidos = null;
+            if (papelera is not null && !_conocidosPorPapelera.TryGetValue(papelera, out conocidos))
+            {
+                conocidos = CapturarMetadatosActuales(papelera);
+                _conocidosPorPapelera[papelera] = conocidos;
+            }
+
+            var inicio = DateTime.UtcNow.Add(-MargenDeFecha);
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _queue.Add((path, tcs));
+            var enviado = tcs.Task.GetAwaiter().GetResult();
+            if (!enviado)
+            {
+                return null;
+            }
+
+            return BuscarMetadatosEnPapelera(path, inicio, conocidos, out _);
+        }
+
+        private void ProcessQueue()
+        {
+            foreach (var (path, tcs) in _queue.GetConsumingEnumerable())
+            {
+                try
+                {
+                    tcs.TrySetResult(EnviarAlShellEnHiloActual(path));
+                }
+                catch
+                {
+                    tcs.TrySetResult(false);
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            _queue.CompleteAdding();
+            if (_staThread.IsAlive)
+            {
+                _staThread.Join(TimeSpan.FromSeconds(5));
+            }
+
+            _queue.Dispose();
+        }
     }
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
@@ -394,10 +555,6 @@ internal static class RecycleBin
         void Compare(IShellItem psi, uint hint, out int piOrder);
     }
 
-    /// <summary>
-    /// IFileOperation de shobjidl_core.h. El orden de los métodos importa: es la
-    /// tabla virtual de COM y debe coincidir exactamente con la del encabezado.
-    /// </summary>
     [ComImport]
     [Guid("947aab5f-0a5c-4c13-b4d6-4bf7836fc9f8")]
     [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]

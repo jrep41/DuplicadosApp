@@ -26,6 +26,9 @@ decompiled/
 # --- Herramientas locales de análisis ---
 .rea-tools/
 
+# --- Rust ---
+rust/target/
+
 # --- Sistema operativo ---
 Thumbs.db
 desktop.ini

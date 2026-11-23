@@ -1,19 +1,25 @@
-using System.Buffers;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
 using DuplicadosApp.Models;
 
 namespace DuplicadosApp.Services;
 
-/// <summary>Progreso notificado durante el escaneo.</summary>
+/// <summary>Progreso notificado durante el escaneo o el borrado.</summary>
 public sealed record ScanProgress(double Percentage, string Text);
 
 /// <summary>
-/// Lógica de búsqueda de duplicados, portada de duplica2.py.
+/// Motor de búsqueda de duplicados multietapa de alto rendimiento:
+/// 1) Recorrido paralelo con agrupación compacta sin asignar listas para tamaños únicos.
+/// 2) Ordenación LPT (grupos más pesados primero) con paralelismo acotado.
+/// 3) Huella rápida en una sola apertura (cabecera 8 KiB + cola 8 KiB + centro 4 KiB)
+///    y deduplicación de enlaces duros (hard links) por FileIdentity.
+/// 4) Para cubetas con 2 archivos: comparación directa byte a byte del rango no leído.
+///    Para cubetas con 3+ archivos: SHA-256 en flujo O(M) + confirmación byte a byte.
 /// </summary>
 public sealed class DuplicateFinder
 {
-    private static readonly int MaxProcessingThreads = Environment.ProcessorCount;
+    private static readonly int MaxComparisonThreads = Math.Clamp(Environment.ProcessorCount, 2, 8);
 
     private readonly Action<string> _log;
     private readonly Action<ScanProgress> _progress;
@@ -21,10 +27,14 @@ public sealed class DuplicateFinder
     private readonly Action<PhaseProgress> _phase;
     private readonly Func<bool> _isPaused;
     private readonly Func<bool> _isCancelled;
+    private readonly Action? _waitIfPaused;
+    private readonly ScanOptions _options;
 
     private int _errors;
+    private int _skippedHardLinks;
     private int _groupsProcessed;
     private int _entriesProcessed;
+    private long _lastProgressTicks;
 
     public DuplicateFinder(
         Action<string> log,
@@ -32,7 +42,9 @@ public sealed class DuplicateFinder
         Func<bool> isPaused,
         Func<bool> isCancelled,
         Action<string>? activity = null,
-        Action<PhaseProgress>? phase = null)
+        Action<PhaseProgress>? phase = null,
+        ScanOptions? options = null,
+        Action? waitIfPaused = null)
     {
         _log = log;
         _progress = progress;
@@ -40,6 +52,8 @@ public sealed class DuplicateFinder
         _isCancelled = isCancelled;
         _activity = activity ?? (_ => { });
         _phase = phase ?? (_ => { });
+        _options = options ?? ScanOptions.Default;
+        _waitIfPaused = waitIfPaused;
     }
 
     public ScanResult Run(string folder)
@@ -58,189 +72,409 @@ public sealed class DuplicateFinder
         Activity("Preparando el escaneo");
         Phase("Preparando el escaneo", 0, indeterminate: true);
         Log($"Iniciando búsqueda en: {folder}");
-        Log("Modo: mismo tamaño y misma extensión; el contenido se confirma byte a byte");
+        Log(BuildModeDescription());
 
-        var bySize = new Dictionary<long, List<FileEntry>>();
-        var foldersSeen = 0;
-        var total = 0;
-        var logEvery = 200;
+        // Agrupación compacta en memoria: para archivos con clave única no se reserva ninguna List<>.
+        var buckets = new Dictionary<BucketKey, SizeBucket>(capacity: 4096);
+        var extIntern = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var bucketLock = new object();
+        var logEveryFolders = 250;
 
-        foreach (var (path, size) in FileSystemService.EnumerateFiles(
-                     folder,
-                     message => { errors++; Log(message); },
-                     (folders, files, currentFolder) =>
-                     {
-                         foldersSeen = folders;
-                         Activity($"Recorriendo {currentFolder}");
-                         Phase("Recorriendo carpetas", 0, indeterminate: true);
-                         Progress(
-                             Math.Min(45, folders / 20),
-                             $"Recorriendo carpetas… {folders} carpetas, {files} archivos ({Elapsed()})");
-
-                         if (folders >= logEvery)
-                         {
-                             Log($"Leyendo {currentFolder}");
-                             Log($"Recorridas {folders} carpetas, {files} archivos encontrados");
-                             logEvery += 200;
-                         }
-                     },
-                     _isPaused,
-                     _isCancelled))
-        {
-            if (_isCancelled())
+        var (foldersSeen, totalFiles, skippedCloud) = FileSystemService.ScanDirectoryParallel(
+            folder,
+            _options,
+            (path, size, lastWriteUtc) =>
             {
-                result.Cancelled = true;
-                result.Errors = errors;
-                return result;
-            }
+                string ext;
+                if (_options.RequireSameExtension)
+                {
+                    var rawExt = Path.GetExtension(path);
+                    lock (bucketLock)
+                    {
+                        if (!extIntern.TryGetValue(rawExt, out ext!))
+                        {
+                            ext = rawExt.ToLowerInvariant();
+                            extIntern[ext] = ext;
+                        }
 
-            WaitWhilePaused();
-            total++;
-
-            if (!bySize.TryGetValue(size, out var list))
+                        AddToBucketUnsafe(buckets, new BucketKey(size, ext), path, lastWriteUtc);
+                    }
+                }
+                else
+                {
+                    lock (bucketLock)
+                    {
+                        AddToBucketUnsafe(buckets, new BucketKey(size, string.Empty), path, lastWriteUtc);
+                    }
+                }
+            },
+            message =>
             {
-                list = [];
-                bySize[size] = list;
-            }
-
-            list.Add(new FileEntry(path, size, FileIdentity.Unknown));
-
-            if (total % 5000 == 0)
+                Interlocked.Increment(ref errors);
+                Log(message);
+            },
+            (folders, files, currentFolder) =>
             {
+                Activity($"Recorriendo {currentFolder}");
+                Phase($"Recorriendo carpetas ({folders:N0} carpetas, {files:N0} archivos)", 0, indeterminate: true);
+
+                // Curva asintótica suave 0 -> 35 % para reflejar progreso constante sin saltos.
+                var discoveryPct = 35.0 * (1.0 - (1.0 / (1.0 + (folders / 250.0))));
                 Progress(
-                    Math.Min(45, foldersSeen / 20),
-                    $"Agrupando por tamaño… {total} archivos ({Elapsed()})");
-                Log($"Leídos {total} archivos ({bySize.Count} tamaños distintos, {errors} errores)");
-            }
-        }
+                    discoveryPct,
+                    $"Recorriendo… {folders:N0} carpetas, {files:N0} archivos ({Elapsed()})");
+
+                if (folders >= logEveryFolders)
+                {
+                    Log($"Recorridas {folders:N0} carpetas, {files:N0} archivos ({Elapsed()})");
+                    logEveryFolders = folders + 250;
+                }
+            },
+            WaitWhilePaused,
+            _isCancelled);
+
+        result.TotalFoldersScanned = foldersSeen;
+        result.TotalFilesScanned = totalFiles;
+        result.SkippedCloudFiles = skippedCloud;
 
         if (_isCancelled())
         {
             result.Cancelled = true;
-            result.Errors = errors;
+            result.Errors = Volatile.Read(ref errors);
+            result.Elapsed = stopwatch.Elapsed;
             return result;
         }
 
-        Log($"Recorrido terminado: {foldersSeen} carpetas y {total} archivos en {Elapsed()}");
-        Activity($"Agrupando por tamaño {total} archivos");
-        Phase($"Agrupando por tamaño ({total} archivos)", 0, indeterminate: true);
-        Progress(45, $"Leídos {total} archivos, agrupando por tamaño…");
+        var discoveryErrors = Volatile.Read(ref errors);
+        Log($"Recorrido terminado: {foldersSeen:N0} carpetas y {totalFiles:N0} archivos en {Elapsed()}"
+            + (skippedCloud > 0 ? $" ({skippedCloud:N0} solo en la nube omitidos)" : string.Empty));
 
-        Log(
-            errors > 0
-                ? $"⚠ Tamaños agrupados: {bySize.Count} tamaños distintos, {errors} archivo(s) con error"
-                : $"Tamaños agrupados: {bySize.Count} tamaños distintos, 0 archivos con error");
-        var candidates = bySize.Where(pair => pair.Value.Count > 1).ToList();
+        Activity($"Filtrando candidatos entre {totalFiles:N0} archivos");
+        Phase($"Filtrando candidatos ({totalFiles:N0} archivos)", 0, indeterminate: true);
+        Progress(35, $"Analizando {totalFiles:N0} archivos…");
+
+        // Extrae solo los grupos con >= 2 archivos y los ordena por carga estimada descendente (LPT).
+        var candidates = new List<(long Size, List<(string Path, DateTime Modified)> Entries)>();
+        var totalEntries = 0;
+
+        foreach (var (key, bucket) in buckets)
+        {
+            if (bucket.Rest is null)
+            {
+                continue;
+            }
+
+            var list = new List<(string Path, DateTime Modified)>(bucket.Rest.Count + 1)
+            {
+                (bucket.FirstPath, bucket.FirstModified),
+            };
+            list.AddRange(bucket.Rest);
+            candidates.Add((key.Size, list));
+            totalEntries += list.Count;
+        }
+
+        // Libera el diccionario temporal cuanto antes para reducir el pico de memoria.
+        buckets.Clear();
+        extIntern.Clear();
+
+        candidates.Sort(static (a, b) =>
+        {
+            var weightA = (double)a.Size * a.Entries.Count;
+            var weightB = (double)b.Size * b.Entries.Count;
+            return weightB.CompareTo(weightA);
+        });
+
         var totalGroups = candidates.Count;
         const string comparisonText = "Comparando contenidos…";
-        Log($"{totalGroups} tamaño(s) con más de un archivo; comparando contenidos");
+        Log(
+            discoveryErrors > 0
+                ? $"⚠ {totalGroups:N0} grupo(s) candidato(s) ({totalEntries:N0} archivos); {discoveryErrors} error(es) de lectura"
+                : $"{totalGroups:N0} grupo(s) candidato(s) ({totalEntries:N0} archivos); comparando contenidos");
 
         var groups = new List<DuplicateGroup>();
         _errors = 0;
+        _skippedHardLinks = 0;
         _groupsProcessed = 0;
         _entriesProcessed = 0;
+        _lastProgressTicks = 0;
         var phaseName = comparisonText.TrimEnd('…');
-        var totalEntries = candidates.Sum(pair => pair.Value.Count);
 
         if (totalGroups > 0)
         {
-            Phase($"{phaseName} (0 de {totalEntries} archivos)", 0);
+            Phase($"{phaseName} (0 de {totalEntries:N0} archivos)", 0);
 
-            Parallel.For(
-                0,
-                totalGroups,
-                new ParallelOptions { MaxDegreeOfParallelism = MaxProcessingThreads },
-                index =>
+            var partitioner = Partitioner.Create(0, totalGroups, rangeSize: 1);
+            Parallel.ForEach(
+                partitioner,
+                new ParallelOptions { MaxDegreeOfParallelism = MaxComparisonThreads },
+                range =>
                 {
-                    if (_isCancelled())
-                    {
-                        return;
-                    }
-
-                    WaitWhilePaused();
-                    var (size, entries) = candidates[index];
-                    Activity($"{comparisonText} tamaño {FormatSize(size)} ({entries.Count} archivos)");
-
-                    void OnFile() => ReportEntryProgress(
-                        Interlocked.Increment(ref _entriesProcessed), totalEntries, phaseName);
-
-                    var partial = new List<DuplicateGroup>();
-                    foreach (var sameExtension in GroupEntriesByExtension(entries))
+                    for (var index = range.Item1; index < range.Item2; index++)
                     {
                         if (_isCancelled())
                         {
                             return;
                         }
 
-                        if (sameExtension.Count < 2)
+                        WaitWhilePaused();
+                        if (_isCancelled())
                         {
-                            // Único archivo con esa extensión y ese tamaño: no hay nada que comparar.
-                            for (var i = 0; i < sameExtension.Count; i++)
+                            return;
+                        }
+
+                        var (size, entries) = candidates[index];
+                        Activity($"{comparisonText} {FormatSize(size)} ({entries.Count} archivos)");
+
+                        void OnFile()
+                        {
+                            var processed = Interlocked.Increment(ref _entriesProcessed);
+                            ReportComparisonProgress(processed, totalEntries, phaseName, comparisonText, Elapsed());
+                        }
+
+                        var partial = new List<DuplicateGroup>();
+                        ConfirmGroup(size, entries, partial, OnFile);
+
+                        if (partial.Count > 0)
+                        {
+                            lock (groups)
                             {
-                                OnFile();
+                                groups.AddRange(partial);
                             }
-
-                            continue;
                         }
 
-                        ConfirmByContent(size, sameExtension, partial, OnFile);
-                    }
-
-                    if (partial.Count > 0)
-                    {
-                        lock (groups)
+                        var doneGroups = Interlocked.Increment(ref _groupsProcessed);
+                        if (doneGroups == totalGroups || doneGroups % 25 == 0)
                         {
-                            groups.AddRange(partial);
+                            Log($"{phaseName}: {doneGroups:N0} de {totalGroups:N0} grupos ({Elapsed()})");
                         }
                     }
-
-                    ReportGroupProgress(Interlocked.Increment(ref _groupsProcessed), totalGroups, comparisonText, Elapsed());
                 });
         }
 
         if (_isCancelled())
         {
             result.Cancelled = true;
-            result.Errors = errors + Volatile.Read(ref _errors);
+            result.Errors = discoveryErrors + Volatile.Read(ref _errors);
+            result.SkippedHardLinks = Volatile.Read(ref _skippedHardLinks);
+            result.Elapsed = stopwatch.Elapsed;
             return result;
         }
 
-        errors += Volatile.Read(ref _errors);
+        var totalErrors = discoveryErrors + Volatile.Read(ref _errors);
+        var hardLinks = Volatile.Read(ref _skippedHardLinks);
 
-        Activity($"Verificando identidad de {groups.Count} grupo(s)");
-        Phase($"Verificando identidad (0 de {groups.Count} grupos)", 0);
-        ResolveIdentities(groups, ref errors, (done, count) =>
+        Activity("Ordenando resultados");
+        Phase("Ordenando resultados", 99);
+        Progress(99, "Ordenando resultados…");
+
+        // Orden por defecto: mayor espacio recuperable primero para priorizar lo más útil.
+        groups.Sort(static (a, b) =>
         {
-            var percent = (long)done * 100 / Math.Max(1, count);
-            Activity($"Verificando identidad de {done} de {count} grupo(s)");
-            Phase($"Verificando identidad ({done} de {count} grupos)", percent);
+            var cmp = b.RecoverableBytes.CompareTo(a.RecoverableBytes);
+            if (cmp != 0)
+            {
+                return cmp;
+            }
+
+            cmp = b.Size.CompareTo(a.Size);
+            return cmp != 0 ? cmp : string.Compare(a.DisplayName, b.DisplayName, StringComparison.OrdinalIgnoreCase);
         });
 
-        if (_isCancelled())
-        {
-            result.Cancelled = true;
-            result.Errors = errors;
-            return result;
-        }
-
-        result.Errors = errors;
-        Log(
-            errors > 0
-                ? $"⚠ Búsqueda terminada en {Elapsed()}: {groups.Count} grupo(s) de duplicados, {errors} error(es)"
-                : $"Búsqueda terminada en {Elapsed()}: {groups.Count} grupo(s) de duplicados, sin errores");
-        Progress(100, "Finalizando…");
+        stopwatch.Stop();
+        result.Errors = totalErrors;
+        result.SkippedHardLinks = hardLinks;
+        result.Elapsed = stopwatch.Elapsed;
         result.Groups.AddRange(groups);
+
+        var extraInfo = hardLinks > 0 ? $", {hardLinks:N0} enlace(s) duro(s) omitido(s)" : string.Empty;
+        Log(
+            totalErrors > 0
+                ? $"⚠ Búsqueda terminada en {Elapsed()}: {groups.Count:N0} grupo(s) de duplicados, {totalErrors} error(es){extraInfo}"
+                : $"Búsqueda terminada en {Elapsed()}: {groups.Count:N0} grupo(s) de duplicados, sin errores{extraInfo}");
+
+        Progress(100, "Listo");
         return result;
     }
 
-    private void ResolveIdentities(
-        List<DuplicateGroup> groups,
-        ref int errors,
-        Action<int, int> onGroup)
+    private string BuildModeDescription()
     {
-        var total = groups.Count;
-        var done = 0;
-        for (var i = groups.Count - 1; i >= 0; i--)
+        var extText = _options.RequireSameExtension ? "mismo tamaño y misma extensión" : "mismo tamaño (cualquier extensión)";
+        var minText = _options.MinFileSizeBytes > 0
+            ? $", mínimo {FormatSize(_options.MinFileSizeBytes)}"
+            : ", incluyendo archivos vacíos";
+        return $"Modo: {extText}{minText}; huella rápida + confirmación byte a byte";
+    }
+
+    private static void AddToBucketUnsafe(
+        Dictionary<BucketKey, SizeBucket> buckets,
+        BucketKey key,
+        string path,
+        DateTime lastWriteUtc)
+    {
+        if (!buckets.TryGetValue(key, out var bucket))
+        {
+            buckets[key] = new SizeBucket(path, lastWriteUtc, null);
+            return;
+        }
+
+        bucket.Rest ??= new List<(string, DateTime)>(2);
+        bucket.Rest.Add((path, lastWriteUtc));
+        buckets[key] = bucket;
+    }
+
+    /// <summary>
+    /// Confirma duplicados dentro de un grupo candidato del mismo tamaño (y extensión si aplica):
+    /// 1) Calcula huella rápida (o completa si &lt;= 16 KiB) en una sola apertura y filtra enlaces duros.
+    /// 2) Agrupa por huella en O(1).
+    /// 3) Confirma exactamente byte a byte (directamente si hay 2 archivos; vía SHA-256 en flujo O(M)
+    ///    seguido de verificación byte a byte si hay 3 o más).
+    /// </summary>
+    private void ConfirmGroup(
+        long size,
+        List<(string Path, DateTime Modified)> entries,
+        List<DuplicateGroup> groups,
+        Action onFile)
+    {
+        var byFingerprint = new Dictionary<ContentHash, List<FileEntry>>();
+        var seenIdentities = new HashSet<FileIdentity>();
+        var isFullHash = size <= FileSystemService.FullReadThreshold;
+
+        foreach (var (path, _) in entries)
+        {
+            onFile();
+
+            if (_isCancelled())
+            {
+                return;
+            }
+
+            WaitWhilePaused();
+            if (_isCancelled())
+            {
+                return;
+            }
+
+            var entry = FileSystemService.TryGetEntryAndFingerprint(
+                path,
+                size,
+                out var fingerprint,
+                out isFullHash);
+
+            if (entry is null)
+            {
+                Interlocked.Increment(ref _errors);
+                continue;
+            }
+
+            // Dos rutas con la misma FileIdentity son enlaces duros al mismo archivo físico:
+            // no ocupan espacio extra ni son copias independientes.
+            if (entry.Identity.IsValid && !seenIdentities.Add(entry.Identity))
+            {
+                Interlocked.Increment(ref _skippedHardLinks);
+                continue;
+            }
+
+            if (!byFingerprint.TryGetValue(fingerprint, out var bucket))
+            {
+                bucket = new List<FileEntry>(2);
+                byFingerprint[fingerprint] = bucket;
+            }
+
+            bucket.Add(entry);
+        }
+
+        foreach (var bucket in byFingerprint.Values)
+        {
+            if (_isCancelled())
+            {
+                return;
+            }
+
+            if (bucket.Count < 2)
+            {
+                continue;
+            }
+
+            if (size == 0)
+            {
+                AddVerifiedGroup(size, bucket, groups);
+                continue;
+            }
+
+            if (isFullHash)
+            {
+                // Archivo <= 16 KiB ya coincidió en SHA-256 completo; confirmación byte a byte en microsegundos.
+                ConfirmBucketByteByByte(size, bucket, startOffset: 0, endOffset: size, groups);
+                continue;
+            }
+
+            var uncheckedStart = (long)FileSystemService.HeaderSize;
+            var uncheckedEnd = size - FileSystemService.TailSize;
+
+            if (bucket.Count == 2)
+            {
+                // Con solo 2 archivos, comparar directamente el rango no leído es óptimo:
+                // se detiene en el primer byte distinto.
+                ConfirmBucketByteByByte(size, bucket, uncheckedStart, uncheckedEnd, groups);
+                continue;
+            }
+
+            // Con 3+ archivos en la misma cubeta, SHA-256 completo en flujo evita O(M²) lecturas.
+            var byFullHash = new Dictionary<ContentHash, List<FileEntry>>();
+            foreach (var entry in bucket)
+            {
+                if (_isCancelled())
+                {
+                    return;
+                }
+
+                WaitWhilePaused();
+                if (!FileSystemService.TryComputeFullHash(entry, out var fullHash, _isCancelled, WaitWhilePaused))
+                {
+                    if (!_isCancelled())
+                    {
+                        Interlocked.Increment(ref _errors);
+                    }
+
+                    continue;
+                }
+
+                if (!byFullHash.TryGetValue(fullHash, out var subBucket))
+                {
+                    subBucket = new List<FileEntry>(2);
+                    byFullHash[fullHash] = subBucket;
+                }
+
+                subBucket.Add(entry);
+            }
+
+            foreach (var subBucket in byFullHash.Values)
+            {
+                if (_isCancelled())
+                {
+                    return;
+                }
+
+                if (subBucket.Count < 2)
+                {
+                    continue;
+                }
+
+                ConfirmBucketByteByByte(size, subBucket, uncheckedStart, uncheckedEnd, groups);
+            }
+        }
+    }
+
+    private void ConfirmBucketByteByByte(
+        long size,
+        List<FileEntry> bucket,
+        long startOffset,
+        long endOffset,
+        List<DuplicateGroup> groups)
+    {
+        var subGroups = new List<List<FileEntry>>(1);
+
+        foreach (var entry in bucket)
         {
             if (_isCancelled())
             {
@@ -248,242 +482,127 @@ public sealed class DuplicateFinder
             }
 
             WaitWhilePaused();
-            var group = groups[i];
-            var resolved = new List<FileEntry>(group.Files.Count);
-            foreach (var file in group.Files)
+            List<FileEntry>? match = null;
+
+            foreach (var existing in subGroups)
             {
                 if (_isCancelled())
                 {
                     return;
                 }
 
-                // La identidad ya se resolvió y verificó durante ConfirmByContent, así que
-                // no hace falta volver a abrir cada archivo en disco.
-                if (file.Identity != FileIdentity.Unknown)
+                var representative = existing[0];
+                try
                 {
-                    resolved.Add(file);
-                    continue;
+                    if (FileSystemService.CompareByteByByte(
+                            entry.Path,
+                            representative.Path,
+                            _isCancelled,
+                            startOffset: startOffset,
+                            endOffset: endOffset,
+                            waitIfPaused: WaitWhilePaused,
+                            expectedIdentityA: entry.Identity,
+                            expectedIdentityB: representative.Identity))
+                    {
+                        match = existing;
+                        break;
+                    }
                 }
-
-                var entry = FileSystemService.TryGetEntry(file.Path);
-                if (entry is null || entry.Size != file.Size)
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
-                    errors++;
-                    continue;
+                    Interlocked.Increment(ref _errors);
                 }
-
-                resolved.Add(entry);
             }
 
-            if (resolved.Count > 1)
+            if (_isCancelled())
             {
-                group.Files = resolved;
+                return;
+            }
+
+            if (match is null)
+            {
+                subGroups.Add([entry]);
             }
             else
             {
-                groups.RemoveAt(i);
-            }
-
-            onGroup(++done, total);
-        }
-    }
-
-    /// <summary>
-    /// Separa los candidatos de un mismo tamaño por extensión. La extensión se compara sin
-    /// distinguir mayúsculas y actúa como requisito: dos archivos de distinto tipo no pueden
-    /// ser el mismo archivo, así que no se gasta tiempo leyéndolos. El nombre no interviene,
-    /// porque dos copias pueden llamarse de forma distinta.
-    /// </summary>
-    private static IEnumerable<List<FileEntry>> GroupEntriesByExtension(List<FileEntry> entries)
-    {
-        var byExtension = new Dictionary<string, List<FileEntry>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var entry in entries)
-        {
-            var extension = Path.GetExtension(entry.Path);
-            if (!byExtension.TryGetValue(extension, out var list))
-            {
-                list = [];
-                byExtension[extension] = list;
-            }
-
-            list.Add(entry);
-        }
-
-        return byExtension.Values;
-    }
-
-    /// <summary>
-    /// Confirma duplicados leyendo la identidad y los primeros 8 KB de cada candidato
-    /// una sola vez. La cabecera del representante de cada subgrupo se conserva en un
-    /// búfer de ArrayPool para descartar en memoria sin releer del disco. Solo cuando
-    /// los primeros 8 KB coinciden y el tamaño supera 8 KB se compara el resto del
-    /// archivo en disco empezando desde el desplazamiento 8192.
-    /// </summary>
-    private void ConfirmByContent(
-        long size,
-        List<FileEntry> entries,
-        List<DuplicateGroup> groups,
-        Action onFile)
-    {
-        var subGroups = new List<(byte[] Header, int HeaderLength, List<FileEntry> Files)>();
-        var headerSize = (int)Math.Min(FileSystemService.HeaderSize, size);
-        var entryHeader = headerSize > 0
-            ? ArrayPool<byte>.Shared.Rent(headerSize)
-            : [];
-
-        try
-        {
-            foreach (var raw in entries)
-            {
-                onFile();
-
-                if (_isCancelled())
-                {
-                    return;
-                }
-
-                WaitWhilePaused();
-
-                var entry = FileSystemService.TryGetEntryAndHeader(
-                    raw.Path,
-                    size,
-                    entryHeader.AsSpan(0, headerSize),
-                    out var headerRead);
-
-                if (entry is null || headerRead != headerSize)
-                {
-                    Interlocked.Increment(ref _errors);
-                    continue;
-                }
-
-                List<FileEntry>? match = null;
-                var entryHeaderSpan = entryHeader.AsSpan(0, headerSize);
-
-                foreach (var candidate in subGroups)
-                {
-                    if (_isCancelled())
-                    {
-                        return;
-                    }
-
-                    // Descarte en memoria sin lecturas de disco.
-                    if (!entryHeaderSpan.SequenceEqual(candidate.Header.AsSpan(0, candidate.HeaderLength)))
-                    {
-                        continue;
-                    }
-
-                    // Si el archivo mide <= 8 KB, la cabecera ya contiene todo el archivo.
-                    if (size <= FileSystemService.HeaderSize)
-                    {
-                        match = candidate.Files;
-                        break;
-                    }
-
-                    try
-                    {
-                        // Compara únicamente a partir del byte 8192.
-                        if (FileSystemService.CompareByteByByte(
-                                entry.Path,
-                                candidate.Files[0].Path,
-                                _isCancelled,
-                                startOffset: FileSystemService.HeaderSize))
-                        {
-                            match = candidate.Files;
-                            break;
-                        }
-                    }
-                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                    {
-                        Interlocked.Increment(ref _errors);
-                    }
-                }
-
-                if (_isCancelled())
-                {
-                    return;
-                }
-
-                if (size > FileSystemService.HeaderSize
-                    && !FileSystemService.MatchesIdentity(entry.Path, entry.Identity, size))
-                {
-                    Interlocked.Increment(ref _errors);
-                    continue;
-                }
-
-                if (match is null)
-                {
-                    var savedHeader = headerSize > 0
-                        ? ArrayPool<byte>.Shared.Rent(headerSize)
-                        : [];
-                    if (headerSize > 0)
-                    {
-                        entryHeaderSpan.CopyTo(savedHeader);
-                    }
-
-                    subGroups.Add((savedHeader, headerSize, [entry]));
-                }
-                else
-                {
-                    match.Add(entry);
-                }
-            }
-
-            foreach (var (_, _, subGroup) in subGroups)
-            {
-                if (subGroup.Count > 1)
-                {
-                    groups.Add(new DuplicateGroup
-                    {
-                        Size = size,
-                        DisplayName = Path.GetFileName(subGroup[0].Path),
-                        Files = subGroup,
-                    });
-                }
+                match.Add(entry);
             }
         }
-        finally
+
+        foreach (var subGroup in subGroups)
         {
-            if (headerSize > 0)
+            if (subGroup.Count > 1)
             {
-                ArrayPool<byte>.Shared.Return(entryHeader);
-                foreach (var (header, _, _) in subGroups)
-                {
-                    ArrayPool<byte>.Shared.Return(header);
-                }
+                AddVerifiedGroup(size, subGroup, groups);
             }
         }
     }
 
-    private void ReportEntryProgress(int processed, int total, string phaseName)
+    private static void AddVerifiedGroup(long size, List<FileEntry> files, List<DuplicateGroup> groups)
     {
-        if (processed % 128 != 0 && processed != total)
+        // Orden determinista dentro del grupo: más antiguo primero (o ruta más corta en empate).
+        files.Sort(static (a, b) =>
         {
-            return;
+            var cmp = a.LastWriteTimeUtc.CompareTo(b.LastWriteTimeUtc);
+            if (cmp != 0)
+            {
+                return cmp;
+            }
+
+            cmp = a.Path.Length.CompareTo(b.Path.Length);
+            return cmp != 0 ? cmp : string.Compare(a.Path, b.Path, StringComparison.OrdinalIgnoreCase);
+        });
+
+        groups.Add(new DuplicateGroup
+        {
+            Size = size,
+            DisplayName = Path.GetFileName(files[0].Path),
+            Files = files,
+        });
+    }
+
+    private void ReportComparisonProgress(
+        int processed,
+        int total,
+        string phaseName,
+        string comparisonText,
+        string elapsed)
+    {
+        var isFinal = processed >= total;
+        if (!isFinal)
+        {
+            var now = Environment.TickCount64;
+            var prev = Interlocked.Read(ref _lastProgressTicks);
+            if (now - prev < 90 || Interlocked.CompareExchange(ref _lastProgressTicks, now, prev) != prev)
+            {
+                return;
+            }
         }
+
+        var safeTotal = Math.Max(1, total);
+        var phasePct = (double)processed * 100.0 / safeTotal;
+        var globalPct = 35.0 + (63.0 * processed / safeTotal);
 
         _phase(new PhaseProgress(
-            $"{phaseName} ({processed} de {total} archivos)",
-            (long)processed * 100 / Math.Max(1, total)));
-    }
-
-    private void ReportGroupProgress(int processed, int total, string comparisonText, string elapsed)
-    {
-        if (processed != 1 && processed % 5 != 0 && processed != total)
-        {
-            return;
-        }
+            $"{phaseName} ({processed:N0} de {total:N0} archivos)",
+            phasePct));
 
         _progress(new ScanProgress(
-            90 + (int)((long)processed * 10 / Math.Max(1, total)),
-            $"{comparisonText} {processed} de {total} ({elapsed})"));
-        _log($"{comparisonText.TrimEnd('…')} grupo {processed} de {total} ({elapsed})");
+            globalPct,
+            $"{comparisonText} {processed:N0} de {total:N0} archivos ({elapsed})"));
     }
 
     private void WaitWhilePaused()
     {
-        while (_isPaused())
+        if (_waitIfPaused is not null)
         {
-            Thread.Sleep(100);
+            _waitIfPaused();
+            return;
+        }
+
+        while (_isPaused() && !_isCancelled())
+        {
+            Thread.Sleep(50);
         }
     }
 
@@ -501,5 +620,14 @@ public sealed class DuplicateFinder
         return unit == 0
             ? $"{bytes} {units[unit]}"
             : $"{value:0.#} {units[unit]}";
+    }
+
+    private readonly record struct BucketKey(long Size, string Extension);
+
+    private struct SizeBucket(string firstPath, DateTime firstModified, List<(string Path, DateTime Modified)>? rest)
+    {
+        public string FirstPath = firstPath;
+        public DateTime FirstModified = firstModified;
+        public List<(string Path, DateTime Modified)>? Rest = rest;
     }
 }

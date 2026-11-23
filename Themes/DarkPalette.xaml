@@ -1,0 +1,60 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:po="http://schemas.microsoft.com/winfx/2006/xaml/presentation/options">
+
+    <!-- Acento -->
+    <Color x:Key="AccentColor">#FF4CC2FF</Color>
+    <Color x:Key="AccentHoverColor">#FF6CCEFF</Color>
+    <Color x:Key="AccentPressedColor">#FF2EAEEB</Color>
+    <Color x:Key="DangerColor">#FFD94338</Color>
+    <Color x:Key="DangerHoverColor">#FFE85A50</Color>
+    <Color x:Key="DangerPressedColor">#FFC03227</Color>
+
+    <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource AccentColor}" po:Freeze="True" />
+    <SolidColorBrush x:Key="AccentHoverBrush" Color="{StaticResource AccentHoverColor}" po:Freeze="True" />
+    <SolidColorBrush x:Key="AccentPressedBrush" Color="{StaticResource AccentPressedColor}" po:Freeze="True" />
+    <SolidColorBrush x:Key="AccentSubtleBrush" Color="#FF1A3447" po:Freeze="True" />
+    <SolidColorBrush x:Key="OnAccentBrush" Color="#FF0F1419" po:Freeze="True" />
+    <SolidColorBrush x:Key="AccentDisabledBrush" Color="#FF284357" po:Freeze="True" />
+
+    <!-- Fondo y superficies -->
+    <SolidColorBrush x:Key="WindowBackgroundBrush" Color="#FF16191E" po:Freeze="True" />
+    <SolidColorBrush x:Key="SurfaceBrush" Color="#FF1F242C" po:Freeze="True" />
+    <SolidColorBrush x:Key="SurfaceAltBrush" Color="#FF262C36" po:Freeze="True" />
+    <SolidColorBrush x:Key="SurfaceHoverBrush" Color="#FF2F3744" po:Freeze="True" />
+    <SolidColorBrush x:Key="SurfaceSelectedBrush" Color="#FF3B2428" po:Freeze="True" />
+    <SolidColorBrush x:Key="BorderBrush" Color="#FF343C4A" po:Freeze="True" />
+    <SolidColorBrush x:Key="DividerBrush" Color="#FF2B323E" po:Freeze="True" />
+    <SolidColorBrush x:Key="TrackBrush" Color="#FF2E3542" po:Freeze="True" />
+
+    <!-- Entradas -->
+    <SolidColorBrush x:Key="InputBackgroundBrush" Color="#FF1A1F26" po:Freeze="True" />
+    <SolidColorBrush x:Key="InputBorderBrush" Color="#FF3B4454" po:Freeze="True" />
+
+    <!-- Texto -->
+    <SolidColorBrush x:Key="TextPrimaryBrush" Color="#FFF0F3F7" po:Freeze="True" />
+    <SolidColorBrush x:Key="TextSecondaryBrush" Color="#FFB2BCC9" po:Freeze="True" />
+    <SolidColorBrush x:Key="TextMutedBrush" Color="#FF838F9E" po:Freeze="True" />
+
+    <!-- Botón neutro -->
+    <SolidColorBrush x:Key="ButtonBackgroundBrush" Color="#FF282F3A" po:Freeze="True" />
+    <SolidColorBrush x:Key="ButtonBorderBrush" Color="#FF3E4756" po:Freeze="True" />
+    <SolidColorBrush x:Key="ButtonHoverBackgroundBrush" Color="#FF323B48" po:Freeze="True" />
+    <SolidColorBrush x:Key="ButtonPressedBackgroundBrush" Color="#FF222832" po:Freeze="True" />
+    <SolidColorBrush x:Key="ButtonDisabledBackgroundBrush" Color="#FF1E232B" po:Freeze="True" />
+    <SolidColorBrush x:Key="ButtonDisabledBorderBrush" Color="#FF2C333F" po:Freeze="True" />
+
+    <!-- Botón de peligro -->
+    <SolidColorBrush x:Key="DangerBrush" Color="{StaticResource DangerColor}" po:Freeze="True" />
+    <SolidColorBrush x:Key="DangerHoverBrush" Color="{StaticResource DangerHoverColor}" po:Freeze="True" />
+    <SolidColorBrush x:Key="DangerPressedBrush" Color="{StaticResource DangerPressedColor}" po:Freeze="True" />
+    <SolidColorBrush x:Key="OnDangerBrush" Color="#FFFFFFFF" po:Freeze="True" />
+    <SolidColorBrush x:Key="DangerDisabledBrush" Color="#FF4A2A2A" po:Freeze="True" />
+    <SolidColorBrush x:Key="DangerDisabledBorderBrush" Color="#FF5A3434" po:Freeze="True" />
+
+    <!-- Registro de actividad -->
+    <SolidColorBrush x:Key="LogWarningBrush" Color="#FFF5B942" po:Freeze="True" />
+    <SolidColorBrush x:Key="LogErrorBrush" Color="#FFFF6B61" po:Freeze="True" />
+
+</ResourceDictionary>
+

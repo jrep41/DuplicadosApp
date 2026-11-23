@@ -5,6 +5,9 @@
     <Application.Resources>
         <ResourceDictionary>
             <ResourceDictionary.MergedDictionaries>
+                <!-- Índice 0: paleta de color intercambiable en caliente (claro/oscuro) -->
+                <ResourceDictionary Source="Themes/LightPalette.xaml" />
+                <!-- Índice 1: tipografía, iconos y plantillas de controles -->
                 <ResourceDictionary Source="Themes/Palette.xaml" />
             </ResourceDictionary.MergedDictionaries>
         </ResourceDictionary>

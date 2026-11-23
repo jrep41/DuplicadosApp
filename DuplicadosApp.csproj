@@ -19,10 +19,14 @@
     AssemblyInfo (CS0579), impidiendo compilar.
   -->
   <ItemGroup>
-    <Compile Remove="bin/**;obj/**;decompiled/**;.rea-tools/**;.vs/**" />
-    <Page Remove="bin/**;obj/**;decompiled/**;.rea-tools/**;.vs/**" />
-    <None Remove="bin/**;obj/**;decompiled/**;.rea-tools/**;.vs/**" />
-    <ApplicationDefinition Remove="decompiled/**" />
+    <Compile Remove="bin/**;obj/**;decompiled/**;.rea-tools/**;.vs/**;rust/**;DuplicadosApp.Tests/**" />
+    <Page Remove="bin/**;obj/**;decompiled/**;.rea-tools/**;.vs/**;rust/**;DuplicadosApp.Tests/**" />
+    <None Remove="bin/**;obj/**;decompiled/**;.rea-tools/**;.vs/**;rust/**;DuplicadosApp.Tests/**" />
+    <ApplicationDefinition Remove="decompiled/**;DuplicadosApp.Tests/**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DuplicadosApp.Tests" />
   </ItemGroup>
 
 </Project>

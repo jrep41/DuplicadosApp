@@ -1,19 +1,18 @@
 using System.IO;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace DuplicadosApp.Services;
 
 /// <summary>
 /// Papelera propia de la aplicación: mueve los archivos a una carpeta gestionada por
-/// la app, conservando su ruta original en un manifiesto.
-///
-/// Existe porque la Papelera de Windows no está disponible en todos los entornos:
-/// dentro de un AppContainer el shell no puede escribir en ella y destruiría los
-/// archivos de forma permanente.
+/// la app, conservando su ruta original en un manifiesto y soportando rutas largas
+/// de forma segura.
 /// </summary>
 public sealed class TrashService
 {
     private const string NombreManifiesto = "manifiesto.txt";
+    private const int MaxSafePathLength = 245;
 
     private readonly string _carpeta;
     private readonly StringBuilder _manifiesto = new();
@@ -23,17 +22,10 @@ public sealed class TrashService
         _carpeta = RutaUnica(carpetaRaiz, momento);
         _manifiesto.AppendLine("Archivos enviados a la papelera de la aplicacion.");
         _manifiesto.AppendLine($"Fecha: {momento:yyyy-MM-dd HH:mm:ss}");
-        _manifiesto.AppendLine("Cada linea es la ruta original de un archivo guardado aqui.");
+        _manifiesto.AppendLine("Cada linea indica la ruta original (y la ruta guardada si se acorto por longitud).");
         _manifiesto.AppendLine();
     }
 
-    /// <summary>
-    /// Elige y reserva la carpeta de esta tanda. El nombre tiene resolución de un segundo,
-    /// así que dos tandas dentro del mismo segundo compartirían carpeta y la segunda
-    /// pisaría el manifiesto de la primera, perdiendo las rutas originales de esos
-    /// archivos. La carpeta se crea aquí mismo para que el nombre quede reservado antes de
-    /// que otra tanda pueda elegirlo.
-    /// </summary>
     private static string RutaUnica(string carpetaRaiz, DateTime momento)
     {
         var nombre = momento.ToString("yyyy-MM-dd_HH-mm-ss");
@@ -42,11 +34,6 @@ public sealed class TrashService
         for (var intento = 1; intento < 100; intento++)
         {
             var destino = Path.Combine(carpetaRaiz, intento == 1 ? nombre : $"{nombre}-{intento}");
-
-            // Se reserva el nombre moviendo un directorio temporal: si el destino ya existe
-            // (dos tandas, o dos instancias de la app, en el mismo segundo) el movimiento
-            // falla y se prueba el siguiente sufijo. Comprobar con Directory.Exists y crear
-            // después no bastaría: CreateDirectory no falla ante un directorio existente.
             var reserva = Path.Combine(carpetaRaiz, $".reserva-{Guid.NewGuid():N}");
             Directory.CreateDirectory(reserva);
 
@@ -57,19 +44,17 @@ public sealed class TrashService
             }
             catch (IOException)
             {
-                // Ese nombre ya está reservado por otra tanda.
                 try
                 {
                     Directory.Delete(reserva, recursive: false);
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
-                    // Da igual: es un directorio vacío temporal.
+                    // Directorio vacío temporal.
                 }
             }
         }
 
-        // Salvaguarda: nunca se comparte carpeta con una tanda anterior.
         var alternativa = Path.Combine(carpetaRaiz, $"{nombre}-{Guid.NewGuid():N}");
         Directory.CreateDirectory(alternativa);
         return alternativa;
@@ -82,7 +67,7 @@ public sealed class TrashService
 
     /// <summary>
     /// Guarda un archivo en la papelera propia. Devuelve false si no se pudo (en cuyo
-    /// caso el llamante debe contar el archivo como error y no ha perdido nada).
+    /// caso el archivo original queda intacto).
     /// </summary>
     public bool Guardar(string rutaOriginal)
     {
@@ -97,13 +82,10 @@ public sealed class TrashService
 
         try
         {
-            destino = RutaDestino(rutaOriginal);
+            var (rutaDestino, acortada) = RutaDestino(rutaOriginal);
+            destino = rutaDestino;
             Directory.CreateDirectory(Path.GetDirectoryName(destino)!);
 
-            // Si el archivo tiene el atributo ReadOnly y se mueve entre volúmenes
-            // distintos (p. ej. de G:\ a %LOCALAPPDATA% en C:\), MoveFileEx copia el
-            // archivo y falla al eliminar el origen. Quitamos ReadOnly antes de mover
-            // y lo restauramos en el destino.
             atributosOriginales = File.GetAttributes(rutaOriginal);
             if ((atributosOriginales & FileAttributes.ReadOnly) != 0)
             {
@@ -118,14 +100,21 @@ public sealed class TrashService
                 File.SetAttributes(destino, atributosOriginales);
             }
 
-            _manifiesto.AppendLine(rutaOriginal);
+            if (acortada)
+            {
+                var relDestino = Path.GetRelativePath(_carpeta, destino);
+                _manifiesto.AppendLine($"{rutaOriginal}  ->  {relDestino}");
+            }
+            else
+            {
+                _manifiesto.AppendLine(rutaOriginal);
+            }
+
             Guardados++;
             return true;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or PathTooLongException)
         {
-            // Si falló un movimiento entre unidades a mitad y el archivo original sigue
-            // intacto, limpiamos cualquier copia parcial en el destino y restauramos atributos.
             try
             {
                 if (File.Exists(rutaOriginal))
@@ -144,24 +133,17 @@ public sealed class TrashService
             }
             catch (Exception)
             {
-                // Ignorado: prioridad a no lanzar excepción hacia el bucle de borrado.
+                // Prioridad a no propagar excepciones en la limpieza de fallo.
             }
 
             return false;
         }
     }
 
-    /// <summary>
-    /// Escribe el manifiesto. Se llama al terminar; si no se puede escribir, los
-    /// archivos siguen guardados (solo se pierde la lista de rutas originales).
-    /// Se añade al final si ya existe, para no borrar el de una tanda anterior.
-    /// </summary>
     public void GuardarManifiesto()
     {
         if (Guardados == 0)
         {
-            // No se guardó nada: se retira la carpeta reservada en el constructor para no
-            // dejar directorios vacíos en la papelera de la aplicación.
             try
             {
                 Directory.Delete(_carpeta, recursive: false);
@@ -189,22 +171,36 @@ public sealed class TrashService
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // El contenido ya está a salvo; el manifiesto es una comodidad, no un requisito.
+            // El contenido ya está a salvo.
         }
     }
 
-    /// <summary>
-    /// Calcula el destino dentro de la papelera conservando la estructura de carpetas
-    /// para que los archivos no se pisen entre sí, y añade un sufijo si ya existe.
-    /// </summary>
-    private string RutaDestino(string rutaOriginal)
+    private (string Destino, bool Acortada) RutaDestino(string rutaOriginal)
     {
         var relativa = RutaRelativa(rutaOriginal);
         var destino = Path.Combine(_carpeta, relativa);
+        var acortada = false;
+
+        // Evita PathTooLongException al combinar la carpeta de papelera con rutas profundas.
+        if (destino.Length >= MaxSafePathLength)
+        {
+            acortada = true;
+            var dirHash = Convert.ToHexString(
+                SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetDirectoryName(rutaOriginal) ?? string.Empty)))[..12];
+            var nombreOriginal = Path.GetFileName(rutaOriginal);
+            var ext = Path.GetExtension(nombreOriginal);
+            var baseName = Path.GetFileNameWithoutExtension(nombreOriginal);
+            if (baseName.Length > 48)
+            {
+                baseName = baseName[..48];
+            }
+
+            destino = Path.Combine(_carpeta, "_rutas_largas", dirHash, baseName + ext);
+        }
 
         if (!File.Exists(destino))
         {
-            return destino;
+            return (destino, acortada);
         }
 
         var carpeta = Path.GetDirectoryName(destino)!;
@@ -218,13 +214,9 @@ public sealed class TrashService
         }
         while (File.Exists(destino));
 
-        return destino;
+        return (destino, acortada);
     }
 
-    /// <summary>
-    /// Convierte la ruta absoluta en una relativa utilizable: sin la letra de unidad
-    /// ni la barra inicial, y sustituyendo los dos puntos para que sea válida.
-    /// </summary>
     private static string RutaRelativa(string rutaOriginal)
     {
         var ruta = Path.GetFullPath(rutaOriginal);

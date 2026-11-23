@@ -1,7 +1,9 @@
-using System.Collections.ObjectModel;
+using System.Collections;
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Windows.Data;
 using System.Windows.Threading;
 using DuplicadosApp.Models;
@@ -9,18 +11,22 @@ using DuplicadosApp.Services;
 
 namespace DuplicadosApp.ViewModels;
 
+/// <summary>Opción legible para mostrar en los selectores de la interfaz.</summary>
+public sealed record NamedOption<T>(T Value, string Label);
+
 /// <summary>
-/// Modelo de vista principal: orquesta el escaneo y el borrado en hilos de fondo
-/// y refleja el progreso en la interfaz, replicando el comportamiento de duplica2.py.
+/// Modelo de vista principal: orquesta el escaneo y el borrado en hilos de fondo,
+/// aplica filtrado/ordenación instantáneos y actualiza la interfaz sin bloqueos.
 /// </summary>
-public sealed class MainViewModel : ObservableObject
+public sealed class MainViewModel : ObservableObject, IDisposable
 {
     private readonly Dispatcher _dispatcher;
     private readonly DispatcherTimer _heartbeat;
-    private readonly ICollectionView _groupedResults;
+    private readonly DispatcherTimer _phaseTimer;
+    private readonly ListCollectionView _resultsView;
 
     private CancellationTokenSource? _cancellation;
-    private volatile bool _isPaused;
+    private PauseGate? _pauseGate;
     private bool _isBusy;
     private bool _isPausedUi;
     private bool _suppressSelectionNotifications;
@@ -28,20 +34,26 @@ public sealed class MainViewModel : ObservableObject
     private string _progressText = "Listo";
     private double _progressValue;
     private bool _isProgressIndeterminate;
-    private string _statusText = "Selecciona una carpeta para empezar.";
+    private string _statusText = "Selecciona o arrastra una carpeta para empezar.";
     private bool _verbose = true;
+    private bool _ignoreEmptyFiles = true;
+    private bool _requireSameExtension = true;
+    private bool _ignoreHiddenAndSystem;
+    private bool _isActivityExpanded = true;
+    private bool _isDarkTheme;
     private bool _hasResults;
     private int _selectedCount;
     private long _selectedBytes;
+    private string _searchFilter = string.Empty;
+    private SortOption _selectedSortOption = SortOption.RecoverableSpaceDesc;
+    private SelectionStrategy _selectedStrategy = SelectionStrategy.KeepOldest;
+    private string _lastScanStatsText = string.Empty;
+    private int _visibleGroupCount;
+    private int _totalDuplicateFilesCount;
+    private long _totalRecoverableBytes;
 
-    /// <summary>
-    /// Índice del próximo grupo. Es un contador propio y no <c>Groups.Count</c> porque los
-    /// grupos pueden desaparecer de la lista (archivos ya movidos a la papelera) y dos
-    /// grupos distintos no deben compartir índice: es la clave con la que el borrado
-    /// localiza a los hermanos de un archivo.
-    /// </summary>
     private int _nextGroupIndex;
-    private string _activity = string.Empty;
+    private volatile string _activity = string.Empty;
     private readonly Stopwatch _operationClock = new();
 
     private string _phaseLabel = "Sin actividad";
@@ -53,32 +65,60 @@ public sealed class MainViewModel : ObservableObject
     private string _phaseLastAction = "Sin actividad";
     private PhaseProgress? _phaseCurrent;
     private long _phaseShownAtTicks;
-    private const int MinPhaseDisplayMs = 250;
-    private readonly DispatcherTimer _phaseTimer;
+    private const int MinPhaseDisplayMs = 200;
 
     private double _pendingProgressValue;
     private string? _pendingProgressText;
     private bool _progressPostPending;
-
-    /// <summary>Protege los campos de progreso: la fase de confirmación los publica desde varios hilos.</summary>
     private readonly object _progressLock = new();
+
+    // Cola por lotes para el registro de actividad: evita saturar el Dispatcher con miles de posts.
+    private readonly ConcurrentQueue<LogLine> _pendingLogs = new();
+    private int _logFlushScheduled;
+
+    private bool _disposed;
 
     public MainViewModel(Dispatcher dispatcher)
     {
         _dispatcher = dispatcher;
 
-        var viewSource = new CollectionViewSource { Source = Groups };
-        viewSource.GroupDescriptions.Add(new PropertyGroupDescription(nameof(DuplicateGroupViewModel.GroupKey)));
-        _groupedResults = viewSource.View;
+        _resultsView = (ListCollectionView)CollectionViewSource.GetDefaultView(Groups);
+        _resultsView.Filter = FilterGroup;
+        _resultsView.CustomSort = new GroupComparer(_selectedSortOption);
+
+        SortOptions =
+        [
+            new(SortOption.RecoverableSpaceDesc, "Mayor espacio recuperable"),
+            new(SortOption.FileSizeDesc, "Mayor tamaño de archivo"),
+            new(SortOption.FileCountDesc, "Más copias"),
+            new(SortOption.NameAsc, "Nombre (A-Z)"),
+        ];
+
+        SelectionStrategies =
+        [
+            new(SelectionStrategy.KeepOldest, "Conservar el más antiguo"),
+            new(SelectionStrategy.KeepNewest, "Conservar el más reciente"),
+            new(SelectionStrategy.KeepShortestPath, "Conservar ruta más corta"),
+            new(SelectionStrategy.KeepFirst, "Conservar el primero"),
+        ];
 
         SelectFolderCommand = new RelayCommand(SelectFolder, () => !IsBusy);
         StartSearchCommand = new RelayCommand(StartSearch, () => !IsBusy && HasFolder);
         TogglePauseCommand = new RelayCommand(TogglePause, () => IsBusy);
         CancelCommand = new RelayCommand(Cancel, () => IsBusy);
-        SelectCopiesCommand = new RelayCommand(SelectAllCopies, () => HasResults && !IsBusy);
-        ClearSelectionCommand = new RelayCommand(ClearSelection, () => HasResults && !IsBusy);
+        SelectCopiesCommand = new RelayCommand(() => SelectByStrategy(SelectedStrategy), () => HasResults && !IsBusy);
+        ClearSelectionCommand = new RelayCommand(ClearSelection, () => SelectedCount > 0 && !IsBusy);
         DeleteSelectedCommand = new RelayCommand(DeleteSelected, () => SelectedCount > 0 && !IsBusy);
+        ExportCsvCommand = new RelayCommand(ExportCsv, () => HasResults && !IsBusy);
         AbrirPapeleraPropiaCommand = new RelayCommand(AbrirPapeleraPropia);
+        ToggleThemeCommand = new RelayCommand(() => IsDarkTheme = !IsDarkTheme);
+        ToggleActivityCommand = new RelayCommand(() => IsActivityExpanded = !IsActivityExpanded);
+        ClearFilterCommand = new RelayCommand(() => SearchFilter = string.Empty, () => !string.IsNullOrEmpty(SearchFilter));
+
+        OpenFileCommand = new RelayCommand<FileItemViewModel>(AbrirArchivo);
+        RevealInExplorerCommand = new RelayCommand<FileItemViewModel>(MostrarEnExplorador);
+        CopyPathCommand = new RelayCommand<FileItemViewModel>(CopiarRuta);
+        KeepOnlyCommand = new RelayCommand<FileItemViewModel>(ConservarSoloEste, _ => !IsBusy);
 
         _heartbeat = new DispatcherTimer(DispatcherPriority.Background, dispatcher)
         {
@@ -91,9 +131,9 @@ public sealed class MainViewModel : ObservableObject
                 return;
             }
 
-            var estado = string.IsNullOrWhiteSpace(Activity) ? "Sin novedades" : Activity;
+            var estado = string.IsNullOrWhiteSpace(_activity) ? "Sin novedades" : _activity;
             var avance = BuildPhaseSummary();
-            AppendLog(_isPaused
+            AppendLog(_pauseGate?.IsPaused == true
                 ? $"…en pausa — {avance} · {estado} ({_operationClock.Elapsed.TotalSeconds:F1}s)"
                 : $"…{avance} · {estado} ({_operationClock.Elapsed.TotalSeconds:F1}s)");
         };
@@ -105,43 +145,38 @@ public sealed class MainViewModel : ObservableObject
         _phaseTimer.Tick += (_, _) => AdvancePhase();
     }
 
-    /// <summary>
-    /// Pregunta al usuario si desea enviar archivos a la papelera. La implementa la vista,
-    /// que recibe el detalle necesario para advertir de lo que no se compara o se conserva.
-    /// </summary>
     public Func<DeletePrompt, bool>? ConfirmDelete { get; set; }
 
-    /// <summary>
-    /// Notifica a la vista que debe mostrar un mensaje informativo. Puede recibir una
-    /// acción que la vista ejecuta cuando el usuario lo cierra.
-    /// </summary>
     public Action<string, string, Action?>? ShowMessage { get; set; }
 
-    /// <summary>Abre una carpeta en el Explorador. La implementa la vista.</summary>
     public Action<string>? OpenFolder { get; set; }
 
-    /// <summary>
-    /// Abre un archivo con la aplicación asociada a su extensión. La implementa la vista,
-    /// que es quien puede lanzar el proceso con el shell de Windows.
-    /// </summary>
     public Action<string>? OpenFile { get; set; }
 
-    /// <summary>
-    /// Carpeta de la papelera propia de la aplicación. Se usa cuando la Papelera de
-    /// reciclaje de Windows no está disponible en el entorno.
-    /// </summary>
+    public Action<string>? RevealFile { get; set; }
+
+    public Action<string>? CopyText { get; set; }
+
+    public Action<bool>? ThemeChanged { get; set; }
+
     public static string RutaPapeleraPropia => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "DuplicadosApp",
         "Borrados");
 
-    /// <summary>Se dispara cuando hay una línea nueva para el panel Actividad.</summary>
-    public event EventHandler<LogLine>? LogAppended;
+    /// <summary>Se dispara por lotes cuando hay líneas nuevas para el panel Actividad.</summary>
+    public event EventHandler<IReadOnlyList<LogLine>>? LogsAppended;
 
-    public ObservableCollection<DuplicateGroupViewModel> Groups { get; } = [];
+    public event EventHandler? LogCleared;
 
-    /// <summary>Vista agrupada y virtualizable de <see cref="Groups"/>.</summary>
-    public ICollectionView GroupedResults => _groupedResults;
+    public BulkObservableCollection<DuplicateGroupViewModel> Groups { get; } = [];
+
+    /// <summary>Vista filtrable, ordenable y virtualizable de <see cref="Groups"/>.</summary>
+    public ICollectionView ResultsView => _resultsView;
+
+    public IReadOnlyList<NamedOption<SortOption>> SortOptions { get; }
+
+    public IReadOnlyList<NamedOption<SelectionStrategy>> SelectionStrategies { get; }
 
     public RelayCommand SelectFolderCommand { get; }
 
@@ -157,14 +192,31 @@ public sealed class MainViewModel : ObservableObject
 
     public RelayCommand DeleteSelectedCommand { get; }
 
+    public RelayCommand ExportCsvCommand { get; }
+
     public RelayCommand AbrirPapeleraPropiaCommand { get; }
+
+    public RelayCommand ToggleThemeCommand { get; }
+
+    public RelayCommand ToggleActivityCommand { get; }
+
+    public RelayCommand ClearFilterCommand { get; }
+
+    public RelayCommand<FileItemViewModel> OpenFileCommand { get; }
+
+    public RelayCommand<FileItemViewModel> RevealInExplorerCommand { get; }
+
+    public RelayCommand<FileItemViewModel> CopyPathCommand { get; }
+
+    public RelayCommand<FileItemViewModel> KeepOnlyCommand { get; }
 
     public string FolderPath
     {
         get => _folderPath;
-        private set
+        set
         {
-            if (SetProperty(ref _folderPath, value))
+            var trimmed = value?.Trim() ?? string.Empty;
+            if (SetProperty(ref _folderPath, trimmed))
             {
                 OnPropertyChanged(nameof(HasFolder));
                 RefreshCommands();
@@ -178,6 +230,79 @@ public sealed class MainViewModel : ObservableObject
     {
         get => _verbose;
         set => SetProperty(ref _verbose, value);
+    }
+
+    public bool IgnoreEmptyFiles
+    {
+        get => _ignoreEmptyFiles;
+        set => SetProperty(ref _ignoreEmptyFiles, value);
+    }
+
+    public bool RequireSameExtension
+    {
+        get => _requireSameExtension;
+        set => SetProperty(ref _requireSameExtension, value);
+    }
+
+    public bool IgnoreHiddenAndSystem
+    {
+        get => _ignoreHiddenAndSystem;
+        set => SetProperty(ref _ignoreHiddenAndSystem, value);
+    }
+
+    public bool IsActivityExpanded
+    {
+        get => _isActivityExpanded;
+        set => SetProperty(ref _isActivityExpanded, value);
+    }
+
+    public bool IsDarkTheme
+    {
+        get => _isDarkTheme;
+        set
+        {
+            if (SetProperty(ref _isDarkTheme, value))
+            {
+                OnPropertyChanged(nameof(ThemeToggleTooltip));
+                ThemeChanged?.Invoke(value);
+            }
+        }
+    }
+
+    public string ThemeToggleTooltip => IsDarkTheme ? "Cambiar a tema claro" : "Cambiar a tema oscuro";
+
+    public string SearchFilter
+    {
+        get => _searchFilter;
+        set
+        {
+            if (SetProperty(ref _searchFilter, value ?? string.Empty))
+            {
+                OnPropertyChanged(nameof(HasSearchFilter));
+                ClearFilterCommand.RaiseCanExecuteChanged();
+                ApplyFilter();
+            }
+        }
+    }
+
+    public bool HasSearchFilter => !string.IsNullOrEmpty(SearchFilter);
+
+    public SortOption SelectedSortOption
+    {
+        get => _selectedSortOption;
+        set
+        {
+            if (SetProperty(ref _selectedSortOption, value))
+            {
+                _resultsView.CustomSort = new GroupComparer(value);
+            }
+        }
+    }
+
+    public SelectionStrategy SelectedStrategy
+    {
+        get => _selectedStrategy;
+        set => SetProperty(ref _selectedStrategy, value);
     }
 
     public bool IsBusy
@@ -242,21 +367,36 @@ public sealed class MainViewModel : ObservableObject
         private set => SetProperty(ref _statusText, value);
     }
 
+    public string LastScanStatsText
+    {
+        get => _lastScanStatsText;
+        private set
+        {
+            if (SetProperty(ref _lastScanStatsText, value))
+            {
+                OnPropertyChanged(nameof(HasScanStats));
+            }
+        }
+    }
+
+    public bool HasScanStats => !string.IsNullOrWhiteSpace(LastScanStatsText);
+
     public string Activity
     {
         get => _activity;
-        private set => SetProperty(ref _activity, value);
+        private set
+        {
+            _activity = value;
+            OnPropertyChanged();
+        }
     }
 
     private void ReportActivity(string text)
     {
+        _activity = text;
         if (_dispatcher.CheckAccess())
         {
-            Activity = text;
-        }
-        else
-        {
-            _activity = text;
+            OnPropertyChanged(nameof(Activity));
         }
     }
 
@@ -276,6 +416,910 @@ public sealed class MainViewModel : ObservableObject
     {
         get => _isPhaseIndeterminate;
         private set => SetProperty(ref _isPhaseIndeterminate, value);
+    }
+
+    public bool HasResults
+    {
+        get => _hasResults;
+        private set
+        {
+            if (SetProperty(ref _hasResults, value))
+            {
+                OnPropertyChanged(nameof(ShowEmptyPlaceholder));
+                OnPropertyChanged(nameof(ShowNoFilterMatch));
+                RefreshCommands();
+            }
+        }
+    }
+
+    public int VisibleGroupCount
+    {
+        get => _visibleGroupCount;
+        private set
+        {
+            if (SetProperty(ref _visibleGroupCount, value))
+            {
+                OnPropertyChanged(nameof(ShowNoFilterMatch));
+            }
+        }
+    }
+
+    public bool ShowEmptyPlaceholder => !HasResults;
+
+    public bool ShowNoFilterMatch => HasResults && VisibleGroupCount == 0;
+
+    public int TotalDuplicateFilesCount
+    {
+        get => _totalDuplicateFilesCount;
+        private set => SetProperty(ref _totalDuplicateFilesCount, value);
+    }
+
+    public long TotalRecoverableBytes
+    {
+        get => _totalRecoverableBytes;
+        private set
+        {
+            if (SetProperty(ref _totalRecoverableBytes, value))
+            {
+                OnPropertyChanged(nameof(TotalRecoverableText));
+            }
+        }
+    }
+
+    public string TotalRecoverableText => FileItemViewModel.FormatSize(TotalRecoverableBytes);
+
+    public int SelectedCount
+    {
+        get => _selectedCount;
+        private set
+        {
+            if (SetProperty(ref _selectedCount, value))
+            {
+                OnPropertyChanged(nameof(SelectionSummary));
+                RefreshCommands();
+            }
+        }
+    }
+
+    public long SelectedBytes
+    {
+        get => _selectedBytes;
+        private set
+        {
+            if (SetProperty(ref _selectedBytes, value))
+            {
+                OnPropertyChanged(nameof(SelectionSummary));
+            }
+        }
+    }
+
+    public string SelectionSummary => SelectedCount == 0
+        ? "Ningún archivo seleccionado"
+        : $"{SelectedCount:N0} archivo(s) · {FileItemViewModel.FormatSize(SelectedBytes)} a liberar";
+
+    public void SelectFolder()
+    {
+        var dialog = new Microsoft.Win32.OpenFolderDialog
+        {
+            Title = "Selecciona la carpeta donde buscar duplicados",
+            Multiselect = false,
+            InitialDirectory = Directory.Exists(FolderPath) ? FolderPath : string.Empty,
+        };
+
+        if (dialog.ShowDialog() == true)
+        {
+            SetFolder(dialog.FolderName);
+        }
+    }
+
+    /// <summary>Acepta una carpeta (o un archivo, usando su carpeta padre) arrastrada a la ventana.</summary>
+    public bool TrySetFolderFromDrop(string droppedPath)
+    {
+        if (IsBusy || string.IsNullOrWhiteSpace(droppedPath))
+        {
+            return false;
+        }
+
+        if (Directory.Exists(droppedPath))
+        {
+            SetFolder(droppedPath);
+            return true;
+        }
+
+        if (File.Exists(droppedPath) && Path.GetDirectoryName(droppedPath) is { } parent && Directory.Exists(parent))
+        {
+            SetFolder(parent);
+            return true;
+        }
+
+        return false;
+    }
+
+    public void SetFolder(string path)
+    {
+        if (IsBusy || string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        FolderPath = path;
+        ClearResults();
+
+        ProgressValue = 0;
+        IsProgressIndeterminate = false;
+        ProgressText = "Listo";
+        Activity = string.Empty;
+        LastScanStatsText = string.Empty;
+        ResetPhase();
+        ClearLog();
+
+        StatusText = "Carpeta lista. Pulsa «Buscar duplicados» (F5).";
+    }
+
+    public ScanOptions BuildCurrentScanOptions() => new()
+    {
+        MinFileSizeBytes = IgnoreEmptyFiles ? 1 : 0,
+        RequireSameExtension = RequireSameExtension,
+        IgnoreHiddenAndSystem = IgnoreHiddenAndSystem,
+        SkipCloudOnlyFiles = true,
+    };
+
+    public void StartSearch()
+    {
+        if (IsBusy || !HasFolder)
+        {
+            return;
+        }
+
+        var folder = FolderPath.Trim().Trim('"');
+        if (!Directory.Exists(folder))
+        {
+            ShowMessage?.Invoke(
+                "Carpeta no encontrada",
+                $"La carpeta indicada no existe o no es accesible:\n\n{folder}",
+                null);
+            return;
+        }
+
+        FolderPath = folder;
+        ClearResults();
+        ClearLog();
+
+        _pauseGate?.Dispose();
+        _pauseGate = new PauseGate();
+        IsPaused = false;
+        IsBusy = true;
+        _operationClock.Restart();
+        _heartbeat.Start();
+        ProgressValue = 0;
+        IsProgressIndeterminate = true;
+        ProgressText = "Preparando el escaneo…";
+        StatusText = "Buscando duplicados…";
+        Activity = "Preparando el escaneo";
+        LastScanStatsText = string.Empty;
+        ResetPhase();
+
+        var options = BuildCurrentScanOptions();
+        _cancellation = new CancellationTokenSource();
+        var token = _cancellation.Token;
+        var pauseGate = _pauseGate;
+
+        Task.Run(() =>
+        {
+            var finder = new DuplicateFinder(
+                AppendLog,
+                QueueProgress,
+                () => pauseGate.IsPaused,
+                () => token.IsCancellationRequested,
+                ReportActivity,
+                ReportPhase,
+                options,
+                () => pauseGate.WaitIfPaused(token));
+
+            ScanResult result;
+            try
+            {
+                result = finder.Run(folder);
+            }
+            catch (Exception ex)
+            {
+                result = new ScanResult { GeneralError = ex.Message };
+                AppendLog($"✖ ERROR inesperado: {ex}");
+            }
+
+            Post(() => FinishSearch(result));
+        });
+    }
+
+    private void FinishSearch(ScanResult result)
+    {
+        StopOperationTimers();
+
+        if (result.Cancelled)
+        {
+            ClearResults();
+            ProgressValue = 0;
+            ProgressText = "Cancelado";
+            StatusText = "Búsqueda cancelada. Puedes ajustar las opciones y volver a buscar.";
+            return;
+        }
+
+        if (!string.IsNullOrEmpty(result.GeneralError))
+        {
+            ClearResults();
+            StatusText = $"No se pudo completar la búsqueda: {result.GeneralError}";
+            ProgressText = "Error";
+            return;
+        }
+
+        ProgressValue = 100;
+        ProgressText = $"Completado en {result.Elapsed.TotalSeconds:F1}s";
+
+        var viewModels = new List<DuplicateGroupViewModel>(result.Groups.Count);
+        foreach (var group in result.Groups)
+        {
+            viewModels.Add(new DuplicateGroupViewModel(group, _nextGroupIndex++, OnItemSelectionChanged));
+        }
+
+        // Una sola notificación Reset para WPF: instantáneo incluso con miles de grupos.
+        Groups.ReplaceAll(viewModels);
+        _resultsView.CustomSort = new GroupComparer(SelectedSortOption);
+        UpdateAggregateMetrics();
+
+        var stats = new List<string>(4)
+        {
+            $"{result.TotalFilesScanned:N0} archivos en {result.TotalFoldersScanned:N0} carpetas",
+            $"{result.Elapsed.TotalSeconds:F1}s",
+        };
+        if (result.SkippedHardLinks > 0)
+        {
+            stats.Add($"{result.SkippedHardLinks:N0} enlace(s) duro(s) omitido(s)");
+        }
+
+        if (result.SkippedCloudFiles > 0)
+        {
+            stats.Add($"{result.SkippedCloudFiles:N0} solo en nube omitido(s)");
+        }
+
+        LastScanStatsText = string.Join(" · ", stats);
+
+        if (Groups.Count == 0)
+        {
+            StatusText = result.Errors > 0
+                ? $"No se encontraron duplicados entre los archivos legibles ({result.Errors:N0} error(es) de lectura)."
+                : "No se encontraron archivos duplicados.";
+        }
+        else
+        {
+            StatusText = BuildResultsStatusText(result.Errors);
+        }
+    }
+
+    public void TogglePause()
+    {
+        if (!IsBusy || _pauseGate is null)
+        {
+            return;
+        }
+
+        if (_pauseGate.IsPaused)
+        {
+            _pauseGate.Resume();
+            IsPaused = false;
+            ProgressText = "Reanudando…";
+            AppendLog("Reanudado por el usuario");
+        }
+        else
+        {
+            _pauseGate.Pause();
+            IsPaused = true;
+            ProgressText = "En pausa";
+            AppendLog("Pausado por el usuario");
+        }
+    }
+
+    public void Cancel()
+    {
+        if (!IsBusy)
+        {
+            return;
+        }
+
+        _pauseGate?.Resume();
+        IsPaused = false;
+        _cancellation?.Cancel();
+        AppendLog("Cancelación solicitada por el usuario");
+        ProgressText = "Cancelando…";
+    }
+
+    /// <summary>Marca todas las copias siguiendo la estrategia elegida (más antiguo, más reciente, ruta más corta o primero).</summary>
+    public void SelectByStrategy(SelectionStrategy strategy)
+    {
+        _suppressSelectionNotifications = true;
+        try
+        {
+            foreach (var group in Groups)
+            {
+                group.SelectByStrategy(strategy);
+            }
+        }
+        finally
+        {
+            _suppressSelectionNotifications = false;
+            RecalcularSeleccion();
+        }
+    }
+
+    /// <summary>Compatibilidad directa: marca todas las copias dejando el primer archivo de cada grupo sin marcar.</summary>
+    public void SelectAllCopies() => SelectByStrategy(SelectionStrategy.KeepFirst);
+
+    public void ClearSelection()
+    {
+        _suppressSelectionNotifications = true;
+        try
+        {
+            foreach (var item in AllItems())
+            {
+                item.IsSelected = false;
+            }
+        }
+        finally
+        {
+            _suppressSelectionNotifications = false;
+            _selectedCount = 0;
+            _selectedBytes = 0;
+            NotifySelectionTotalsChanged();
+        }
+    }
+
+    /// <summary>Conserva únicamente este archivo dentro de su grupo y marca el resto para borrar.</summary>
+    public void ConservarSoloEste(FileItemViewModel item)
+    {
+        if (IsBusy)
+        {
+            return;
+        }
+
+        _suppressSelectionNotifications = true;
+        try
+        {
+            item.Group.KeepOnly(item);
+        }
+        finally
+        {
+            _suppressSelectionNotifications = false;
+            RecalcularSeleccion();
+        }
+    }
+
+    public void AbrirArchivo(FileItemViewModel item)
+    {
+        if (!File.Exists(item.Path))
+        {
+            ShowMessage?.Invoke(
+                "Aviso",
+                $"El archivo ya no está en su ruta:\n\n{item.Path}\n\n" +
+                "Es posible que se haya movido o enviado a la papelera desde otra ventana.",
+                null);
+            return;
+        }
+
+        OpenFile?.Invoke(item.Path);
+    }
+
+    public void MostrarEnExplorador(FileItemViewModel item)
+    {
+        if (File.Exists(item.Path))
+        {
+            RevealFile?.Invoke(item.Path);
+            return;
+        }
+
+        var dir = Path.GetDirectoryName(item.Path);
+        if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
+        {
+            OpenFolder?.Invoke(dir);
+            return;
+        }
+
+        ShowMessage?.Invoke("Aviso", $"Ni el archivo ni su carpeta existen ya:\n\n{item.Path}", null);
+    }
+
+    public void CopiarRuta(FileItemViewModel item) => CopyText?.Invoke(item.Path);
+
+    public void ExportCsv()
+    {
+        if (!HasResults || IsBusy)
+        {
+            return;
+        }
+
+        var dialog = new Microsoft.Win32.SaveFileDialog
+        {
+            Title = "Exportar informe de duplicados",
+            Filter = "Archivo CSV (*.csv)|*.csv|Todos los archivos (*.*)|*.*",
+            FileName = $"duplicados-{DateTime.Now:yyyyMMdd-HHmmss}.csv",
+            DefaultExt = ".csv",
+        };
+
+        if (dialog.ShowDialog() != true)
+        {
+            return;
+        }
+
+        try
+        {
+            var sb = new StringBuilder(capacity: 4096);
+            sb.AppendLine("Grupo;Nombre;TamanoBytes;TamanoLegible;Modificado;Seleccionado;Ruta");
+            var groupNum = 0;
+            foreach (var group in Groups)
+            {
+                groupNum++;
+                foreach (var file in group.Files)
+                {
+                    sb.Append(groupNum).Append(';')
+                      .Append(EscapeCsv(group.DisplayName)).Append(';')
+                      .Append(file.Size).Append(';')
+                      .Append(EscapeCsv(file.SizeText)).Append(';')
+                      .Append(EscapeCsv(file.ModifiedText)).Append(';')
+                      .Append(file.IsSelected ? "Si" : "No").Append(';')
+                      .AppendLine(EscapeCsv(file.Path));
+                }
+            }
+
+            File.WriteAllText(dialog.FileName, sb.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+            AppendLog($"Informe exportado en: {dialog.FileName}");
+            ShowMessage?.Invoke("Informe exportado", $"Se guardó el informe en:\n\n{dialog.FileName}", null);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            ShowMessage?.Invoke("Error al exportar", $"No se pudo guardar el informe:\n\n{ex.Message}", null);
+        }
+    }
+
+    private static string EscapeCsv(string value)
+    {
+        if (value.Contains(';') || value.Contains('"') || value.Contains('\n') || value.Contains('\r'))
+        {
+            return $"\"{value.Replace("\"", "\"\"")}\"";
+        }
+
+        return value;
+    }
+
+    public void AbrirPapeleraPropia()
+    {
+        try
+        {
+            Directory.CreateDirectory(RutaPapeleraPropia);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            ShowMessage?.Invoke("Aviso", $"No se pudo abrir la carpeta: {ex.Message}", null);
+            return;
+        }
+
+        OpenFolder?.Invoke(RutaPapeleraPropia);
+    }
+
+    private void AbrirPapeleraPropiaSiTieneContenido(string carpeta)
+    {
+        if (string.IsNullOrWhiteSpace(carpeta) || !Directory.Exists(carpeta))
+        {
+            return;
+        }
+
+        try
+        {
+            if (Directory.EnumerateFileSystemEntries(carpeta).Any())
+            {
+                OpenFolder?.Invoke(carpeta);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+        }
+    }
+
+    private void OnItemSelectionChanged(FileItemViewModel item, bool isSelected, long size)
+    {
+        if (_suppressSelectionNotifications)
+        {
+            _selectedCount += isSelected ? 1 : -1;
+            _selectedBytes += isSelected ? size : -size;
+            return;
+        }
+
+        SelectedCount += isSelected ? 1 : -1;
+        SelectedBytes += isSelected ? size : -size;
+    }
+
+    private void NotifySelectionTotalsChanged()
+    {
+        OnPropertyChanged(nameof(SelectedCount));
+        OnPropertyChanged(nameof(SelectedBytes));
+        OnPropertyChanged(nameof(SelectionSummary));
+        RefreshCommands();
+    }
+
+    public void DeleteSelected()
+    {
+        if (IsBusy)
+        {
+            return;
+        }
+
+        var marcados = AllItems().Where(item => item.IsSelected).ToList();
+        if (marcados.Count == 0)
+        {
+            ShowMessage?.Invoke("Aviso", "No has seleccionado ningún archivo para eliminar.", null);
+            return;
+        }
+
+        // Si en un grupo están marcadas TODAS las copias, se conserva la mejor copia según la estrategia.
+        var conservar = new HashSet<FileItemViewModel>();
+        foreach (var grupo in Groups)
+        {
+            if (grupo.Files.Count > 0 && grupo.Files.All(item => item.IsSelected))
+            {
+                conservar.Add(grupo.Files[0]);
+            }
+        }
+
+        var aEnviar = marcados.Where(item => !conservar.Contains(item)).ToList();
+        if (aEnviar.Count == 0)
+        {
+            ShowMessage?.Invoke(
+                "Aviso",
+                "No hay nada que enviar: de cada grupo marcado se conserva al menos una copia.",
+                null);
+            return;
+        }
+
+        var bytesToFree = aEnviar.Sum(item => item.Size);
+        if (ConfirmDelete?.Invoke(new DeletePrompt(aEnviar.Count, bytesToFree, conservar.Count)) != true)
+        {
+            return;
+        }
+
+        var selected = aEnviar.Select(item => item.ToCandidate()).ToList();
+        var all = AllItems().Select(item => item.ToCandidate()).ToList();
+
+        _pauseGate?.Dispose();
+        _pauseGate = new PauseGate();
+        IsPaused = false;
+        IsBusy = true;
+        _operationClock.Restart();
+        _heartbeat.Start();
+        ProgressValue = 0;
+        IsProgressIndeterminate = false;
+        ProgressText = "Guardando en la papelera…";
+        StatusText = "Enviando los archivos seleccionados a la papelera…";
+        Activity = "Iniciando el envío a la papelera";
+        ResetPhase();
+
+        _cancellation = new CancellationTokenSource();
+        var token = _cancellation.Token;
+        var pauseGate = _pauseGate;
+        var folder = FolderPath;
+
+        Task.Run(() =>
+        {
+            var deleter = new FileDeleter(
+                AppendLog,
+                () => pauseGate.IsPaused,
+                () => token.IsCancellationRequested,
+                recycleDisponible: () => RecycleBin.IsAvailable(folder),
+                papeleraPropia: () => new TrashService(RutaPapeleraPropia, DateTime.Now),
+                activity: ReportActivity,
+                phase: ReportPhase,
+                progress: QueueProgress,
+                waitIfPaused: () => pauseGate.WaitIfPaused(token));
+
+            DeleteOutcome outcome;
+            try
+            {
+                outcome = deleter.Delete(selected, all);
+            }
+            catch (Exception ex)
+            {
+                outcome = new DeleteOutcome { Errors = selected.Count };
+                AppendLog($"✖ ERROR inesperado: {ex}");
+            }
+
+            Post(() => FinishDelete(outcome));
+        });
+    }
+
+    private void FinishDelete(DeleteOutcome outcome)
+    {
+        StopOperationTimers();
+
+        // Quita los archivos movidos y los grupos que ya no tienen duplicados (< 2 archivos).
+        // Así la lista se actualiza al instante sin reescanear todo el disco ni borrar el registro.
+        QuitarDeLosResultados(outcome.Movidos);
+
+        var movidos = outcome.Deleted + outcome.SinVerificar;
+
+        if (outcome.Cancelled)
+        {
+            StatusText = movidos > 0
+                ? $"Envío cancelado: {movidos:N0} archivo(s) movido(s). Quedan {Groups.Count:N0} grupo(s)."
+                : "Envío a la papelera cancelado.";
+            ProgressText = "Cancelado";
+        }
+        else if (outcome.Errors > 0)
+        {
+            StatusText = $"Terminado con {outcome.Errors:N0} error(es) y {movidos:N0} archivo(s) movido(s). Quedan {Groups.Count:N0} grupo(s).";
+            ProgressText = "Con avisos";
+        }
+        else if (outcome.SinVerificar > 0)
+        {
+            StatusText = $"Terminado: {movidos:N0} archivo(s) movido(s), {outcome.SinVerificar:N0} sin verificar.";
+            ProgressText = "Con avisos";
+        }
+        else
+        {
+            StatusText = Groups.Count == 0
+                ? $"¡Todo limpio! {movidos:N0} archivo(s) enviado(s) a la papelera; no quedan duplicados."
+                : $"Movidos {movidos:N0} archivo(s) a la papelera · Quedan {BuildResultsStatusText(0)}";
+            ProgressValue = 100;
+            ProgressText = "Listo";
+        }
+
+        MostrarResultadoDelBorrado(outcome, movidos);
+    }
+
+    /// <summary>
+    /// Quita de los resultados los archivos movidos y descarta los grupos que se quedan
+    /// con menos de 2 archivos (ya no son duplicados).
+    /// </summary>
+    public void QuitarDeLosResultados(IReadOnlyCollection<string> rutas)
+    {
+        if (rutas.Count == 0)
+        {
+            return;
+        }
+
+        var movidas = new HashSet<string>(rutas, StringComparer.OrdinalIgnoreCase);
+
+        _suppressSelectionNotifications = true;
+        try
+        {
+            for (var i = Groups.Count - 1; i >= 0; i--)
+            {
+                var grupo = Groups[i];
+                for (var j = grupo.Files.Count - 1; j >= 0; j--)
+                {
+                    if (movidas.Contains(grupo.Files[j].Path))
+                    {
+                        grupo.Quitar(grupo.Files[j]);
+                    }
+                }
+
+                if (grupo.Files.Count < 2)
+                {
+                    Groups.RemoveAt(i);
+                }
+            }
+        }
+        finally
+        {
+            _suppressSelectionNotifications = false;
+            RecalcularSeleccion();
+            UpdateAggregateMetrics();
+        }
+    }
+
+    private void MostrarResultadoDelBorrado(DeleteOutcome outcome, int movidos)
+    {
+        var partes = new List<string>(3);
+
+        if (outcome.Errors > 0)
+        {
+            partes.Add(
+                $"{outcome.Errors:N0} archivo(s) no se pudieron mover porque cambiaron o no se " +
+                "pudieron procesar. Siguen en su sitio.");
+        }
+
+        if (outcome.SinVerificar > 0)
+        {
+            partes.Add(
+                $"{outcome.SinVerificar:N0} archivo(s) ya no están en su carpeta original, pero no " +
+                "se pudo confirmar que estén en la Papelera de reciclaje. Compruébalo en la " +
+                "Papelera antes de darlos por perdidos.");
+        }
+
+        if (movidos > 0)
+        {
+            var verificados = outcome.Destino == DeleteDestination.PapeleraDeLaApp
+                ? movidos
+                : outcome.Deleted;
+
+            partes.Add(outcome.Destino == DeleteDestination.PapeleraDeLaApp
+                ? $"Se guardaron {verificados:N0} archivo(s) en la papelera propia de la aplicación:\n\n" +
+                  $"{outcome.CarpetaPapeleraPropia}\n\n" +
+                  "Cada archivo conserva su ruta original en manifiesto.txt, así que puedes " +
+                  "devolverlos a su sitio si te arrepientes."
+                : $"Se enviaron {verificados:N0} archivo(s) a la Papelera de reciclaje. Si te " +
+                  "arrepientes, puedes restaurarlos desde la Papelera.");
+        }
+
+        if (partes.Count == 0)
+        {
+            return;
+        }
+
+        var titulo = outcome.Errors > 0 || outcome.SinVerificar > 0 ? "Aviso" : "Listo";
+        var mensaje = string.Join("\n\n", partes);
+        var abrirCarpeta = outcome.Destino == DeleteDestination.PapeleraDeLaApp
+                           && outcome.CarpetaPapeleraPropia.Length > 0
+            ? () => AbrirPapeleraPropiaSiTieneContenido(outcome.CarpetaPapeleraPropia)
+            : (Action?)null;
+
+        if (abrirCarpeta is not null)
+        {
+            mensaje += "\n\nSe abrirá esa carpeta al cerrar este aviso.";
+        }
+
+        ShowMessage?.Invoke(titulo, mensaje, abrirCarpeta);
+    }
+
+    private void StopOperationTimers()
+    {
+        _heartbeat.Stop();
+        _operationClock.Stop();
+        lock (_progressLock)
+        {
+            _progressPostPending = false;
+            _pendingProgressText = null;
+        }
+
+        IsProgressIndeterminate = false;
+        IsBusy = false;
+        IsPaused = false;
+        _pauseGate?.Dispose();
+        _pauseGate = null;
+        _cancellation?.Dispose();
+        _cancellation = null;
+        ResetPhase();
+    }
+
+    private bool FilterGroup(object obj)
+    {
+        if (string.IsNullOrWhiteSpace(_searchFilter))
+        {
+            return true;
+        }
+
+        return obj is DuplicateGroupViewModel group && group.MatchesFilter(_searchFilter);
+    }
+
+    private void ApplyFilter()
+    {
+        _resultsView.Refresh();
+        VisibleGroupCount = _resultsView.Count;
+    }
+
+    private void UpdateAggregateMetrics()
+    {
+        var filesCount = 0;
+        long recoverable = 0;
+        foreach (var group in Groups)
+        {
+            filesCount += group.FileCount;
+            recoverable += group.RecoverableBytes;
+        }
+
+        TotalDuplicateFilesCount = filesCount;
+        TotalRecoverableBytes = recoverable;
+        HasResults = Groups.Count > 0;
+        VisibleGroupCount = _resultsView.Count;
+    }
+
+    private string BuildResultsStatusText(int errors)
+    {
+        return $"{Groups.Count:N0} grupo(s) · {TotalDuplicateFilesCount:N0} archivos · " +
+               $"{TotalRecoverableText} recuperables" +
+               (errors > 0 ? $" · {errors:N0} error(es) de lectura" : string.Empty);
+    }
+
+    private void RecalcularSeleccion()
+    {
+        var count = 0;
+        long bytes = 0;
+        foreach (var item in AllItems())
+        {
+            if (item.IsSelected)
+            {
+                count++;
+                bytes += item.Size;
+            }
+        }
+
+        _selectedCount = count;
+        _selectedBytes = bytes;
+        NotifySelectionTotalsChanged();
+    }
+
+    private IEnumerable<FileItemViewModel> AllItems() => Groups.SelectMany(group => group.Files);
+
+    private void ClearResults()
+    {
+        Groups.ReplaceAll([]);
+        _nextGroupIndex = 0;
+        _searchFilter = string.Empty;
+        OnPropertyChanged(nameof(SearchFilter));
+        OnPropertyChanged(nameof(HasSearchFilter));
+        ClearFilterCommand.RaiseCanExecuteChanged();
+        TotalDuplicateFilesCount = 0;
+        TotalRecoverableBytes = 0;
+        HasResults = false;
+        VisibleGroupCount = 0;
+        SelectedCount = 0;
+        SelectedBytes = 0;
+    }
+
+    private void ClearLog()
+    {
+        while (_pendingLogs.TryDequeue(out _))
+        {
+        }
+
+        LogCleared?.Invoke(this, EventArgs.Empty);
+    }
+
+    private static LogSeverity Clasificar(string text)
+    {
+        if (text.StartsWith('✖'))
+        {
+            return LogSeverity.Error;
+        }
+
+        return text.StartsWith('⚠') ? LogSeverity.Warning : LogSeverity.Normal;
+    }
+
+    private void AppendLog(string text)
+    {
+        if (!Verbose)
+        {
+            return;
+        }
+
+        _pendingLogs.Enqueue(new LogLine(
+            Clasificar(text),
+            $"[{DateTime.Now:HH:mm:ss}] {text}"));
+
+        if (Interlocked.CompareExchange(ref _logFlushScheduled, 1, 0) == 0)
+        {
+            Post(FlushPendingLogs);
+        }
+    }
+
+    private void FlushPendingLogs()
+    {
+        Interlocked.Exchange(ref _logFlushScheduled, 0);
+
+        if (_pendingLogs.IsEmpty)
+        {
+            return;
+        }
+
+        var batch = new List<LogLine>(32);
+        while (batch.Count < 256 && _pendingLogs.TryDequeue(out var line))
+        {
+            batch.Add(line);
+        }
+
+        if (batch.Count > 0)
+        {
+            LogsAppended?.Invoke(this, batch);
+        }
+
+        if (!_pendingLogs.IsEmpty && Interlocked.CompareExchange(ref _logFlushScheduled, 1, 0) == 0)
+        {
+            Post(FlushPendingLogs);
+        }
     }
 
     private void ReportPhase(PhaseProgress phase)
@@ -385,8 +1429,7 @@ public sealed class MainViewModel : ObservableObject
     {
         if (string.IsNullOrWhiteSpace(PhaseLabel) || PhaseLabel == "Sin actividad")
         {
-            var estado = string.IsNullOrWhiteSpace(Activity) ? "Sin novedades" : Activity;
-            return estado;
+            return string.IsNullOrWhiteSpace(_activity) ? "Sin novedades" : _activity;
         }
 
         return IsPhaseIndeterminate
@@ -416,633 +1459,6 @@ public sealed class MainViewModel : ObservableObject
         {
             _phaseTimer.Stop();
         }
-    }
-
-    public bool HasResults
-    {
-        get => _hasResults;
-        private set
-        {
-            if (SetProperty(ref _hasResults, value))
-            {
-                RefreshCommands();
-            }
-        }
-    }
-
-    public int SelectedCount
-    {
-        get => _selectedCount;
-        private set
-        {
-            if (SetProperty(ref _selectedCount, value))
-            {
-                OnPropertyChanged(nameof(SelectionSummary));
-                RefreshCommands();
-            }
-        }
-    }
-
-    public string SelectionSummary => SelectedCount == 0
-        ? "Ningún archivo seleccionado"
-        : $"{SelectedCount} archivo(s) seleccionado(s) · " +
-          $"{FileItemViewModel.FormatSize(SelectedBytes)} a liberar";
-
-    public long SelectedBytes
-    {
-        get => _selectedBytes;
-        private set
-        {
-            if (SetProperty(ref _selectedBytes, value))
-            {
-                OnPropertyChanged(nameof(SelectionSummary));
-            }
-        }
-    }
-
-    public void SelectFolder()
-    {
-        var dialog = new Microsoft.Win32.OpenFolderDialog
-        {
-            Title = "Selecciona la carpeta donde buscar duplicados",
-            Multiselect = false,
-        };
-
-        if (dialog.ShowDialog() == true)
-        {
-            SetFolder(dialog.FolderName);
-        }
-    }
-
-    public void SetFolder(string path)
-    {
-        if (IsBusy || string.IsNullOrWhiteSpace(path))
-        {
-            return;
-        }
-
-        FolderPath = path;
-        ClearResults();
-
-        ProgressValue = 0;
-        IsProgressIndeterminate = false;
-        ProgressText = "Listo";
-        Activity = string.Empty;
-        ResetPhase();
-        ClearLog();
-
-        StatusText = "Carpeta lista. Pulsa «Buscar duplicados».";
-    }
-
-    public void StartSearch()
-    {
-        if (IsBusy || !HasFolder)
-        {
-            return;
-        }
-
-        ClearResults();
-        ClearLog();
-        _isPaused = false;
-        IsPaused = false;
-        IsBusy = true;
-        _operationClock.Restart();
-        _heartbeat.Start();
-        ProgressValue = double.NaN;
-        IsProgressIndeterminate = true;
-        ProgressText = "Preparando el escaneo…";
-        StatusText = "Buscando duplicados…";
-        Activity = "Preparando el escaneo";
-        ResetPhase();
-
-        var folder = FolderPath;
-        _cancellation = new CancellationTokenSource();
-        var token = _cancellation.Token;
-
-        Task.Run(() =>
-        {
-            var finder = new DuplicateFinder(
-                AppendLog,
-                QueueProgress,
-                () => _isPaused,
-                () => token.IsCancellationRequested,
-                ReportActivity,
-                ReportPhase);
-
-            ScanResult result;
-            try
-            {
-                result = finder.Run(folder);
-            }
-            catch (Exception ex)
-            {
-                result = new ScanResult { GeneralError = ex.Message };
-                AppendLog($"✖ ERROR inesperado: {ex}");
-            }
-
-            Post(() => FinishSearch(result));
-        });
-    }
-
-    private void FinishSearch(ScanResult result)
-    {
-        _heartbeat.Stop();
-        _operationClock.Stop();
-        _progressPostPending = false;
-        _pendingProgressText = null;
-        IsProgressIndeterminate = false;
-        IsBusy = false;
-        IsPaused = false;
-        _isPaused = false;
-        _cancellation?.Dispose();
-        _cancellation = null;
-        ResetPhase();
-
-        if (result.Cancelled)
-        {
-            ResetToInitialState();
-            return;
-        }
-
-        if (!string.IsNullOrEmpty(result.GeneralError))
-        {
-            ClearResults();
-            StatusText = $"No se pudo completar la búsqueda: {result.GeneralError}";
-            ProgressText = "Error";
-            return;
-        }
-
-        HasResults = result.Groups.Count > 0;
-        ProgressValue = 100;
-        ProgressText = "Listo";
-
-        foreach (var group in result.Groups)
-        {
-            Groups.Add(new DuplicateGroupViewModel(group, _nextGroupIndex++, OnItemSelectionChanged));
-        }
-
-        if (Groups.Count == 0)
-        {
-            StatusText = result.Errors > 0
-                ? "No se encontraron duplicados entre los archivos que se pudieron leer."
-                : "No se encontraron archivos duplicados.";
-        }
-        else
-        {
-            var recoverable = Groups.Sum(g => g.Size * (g.Files.Count - 1));
-            StatusText =
-                $"{Groups.Count} grupo(s) de duplicados · " +
-                $"{FileItemViewModel.FormatSize(recoverable)} recuperables" +
-                (result.Errors > 0 ? $" · {result.Errors} archivo(s) con error" : string.Empty);
-        }
-    }
-
-    public void TogglePause()
-    {
-        if (!IsBusy)
-        {
-            return;
-        }
-
-        _isPaused = !_isPaused;
-        IsPaused = _isPaused;
-        ProgressText = _isPaused ? "En pausa" : "Reanudando…";
-        AppendLog(_isPaused ? "Pausado por el usuario" : "Reanudado por el usuario");
-    }
-
-    public void Cancel()
-    {
-        if (!IsBusy)
-        {
-            return;
-        }
-
-        _isPaused = false;
-        IsPaused = false;
-        _cancellation?.Cancel();
-        AppendLog("Cancelación solicitada por el usuario");
-        ProgressText = "Cancelando…";
-    }
-
-    /// <summary>Marca todas las copias dejando el primer archivo de cada grupo sin marcar.</summary>
-    public void SelectAllCopies()
-    {
-        _suppressSelectionNotifications = true;
-        try
-        {
-            foreach (var group in Groups)
-            {
-                for (var i = 0; i < group.Files.Count; i++)
-                {
-                    group.Files[i].IsSelected = i > 0;
-                }
-            }
-        }
-        finally
-        {
-            _suppressSelectionNotifications = false;
-            NotifySelectionTotalsChanged();
-        }
-    }
-
-    public void ClearSelection()
-    {
-        _suppressSelectionNotifications = true;
-        try
-        {
-            foreach (var item in AllItems())
-            {
-                item.IsSelected = false;
-            }
-        }
-        finally
-        {
-            _suppressSelectionNotifications = false;
-            NotifySelectionTotalsChanged();
-        }
-    }
-
-    /// <summary>
-    /// Abre una de las rutas listadas con la aplicación asociada a su extensión. Sirve para
-    /// comprobar el contenido de una copia antes de decidir cuál sobra; no toca la selección
-    /// ni el resultado de la búsqueda, así que se puede abrir y volver sin perder nada.
-    /// </summary>
-    public void AbrirArchivo(FileItemViewModel item)
-    {
-        // El archivo pudo desaparecer entre el escaneo y el doble clic (por ejemplo, porque
-        // se envió a la papelera). Se avisa aquí y no se delega al shell, cuyo mensaje
-        // ("El sistema no puede encontrar el archivo especificado") no dice qué ruta falla.
-        if (!File.Exists(item.Path))
-        {
-            ShowMessage?.Invoke(
-                "Aviso",
-                $"El archivo ya no está en su ruta:\n\n{item.Path}\n\n" +
-                "Es posible que se haya movido o enviado a la papelera desde otra ventana.",
-                null);
-            return;
-        }
-
-        OpenFile?.Invoke(item.Path);
-    }
-
-    /// <summary>Abre en el Explorador la carpeta de la papelera propia.</summary>
-    public void AbrirPapeleraPropia()
-    {
-        try
-        {
-            Directory.CreateDirectory(RutaPapeleraPropia);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            ShowMessage?.Invoke("Aviso", $"No se pudo abrir la carpeta: {ex.Message}", null);
-            return;
-        }
-
-        OpenFolder?.Invoke(RutaPapeleraPropia);
-    }
-
-    private void AbrirPapeleraPropiaSiTieneContenido(string carpeta)
-    {
-        if (string.IsNullOrWhiteSpace(carpeta) || !Directory.Exists(carpeta))
-        {
-            return;
-        }
-
-        try
-        {
-            if (Directory.EnumerateFileSystemEntries(carpeta).Any())
-            {
-                OpenFolder?.Invoke(carpeta);
-            }
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-        }
-    }
-
-    /// <summary>
-    /// Actualiza los totales de selección sin recorrer la lista. Cuando se ejecuta
-    /// dentro de una operación masiva, acumula en silencio y notifica una sola vez al final.
-    /// </summary>
-    private void OnItemSelectionChanged(FileItemViewModel item, bool isSelected, long size)
-    {
-        if (_suppressSelectionNotifications)
-        {
-            _selectedCount += isSelected ? 1 : -1;
-            _selectedBytes += isSelected ? size : -size;
-            return;
-        }
-
-        SelectedCount += isSelected ? 1 : -1;
-        SelectedBytes += isSelected ? size : -size;
-    }
-
-    private void NotifySelectionTotalsChanged()
-    {
-        OnPropertyChanged(nameof(SelectedCount));
-        OnPropertyChanged(nameof(SelectedBytes));
-        OnPropertyChanged(nameof(SelectionSummary));
-        RefreshCommands();
-    }
-
-    public void DeleteSelected()
-    {
-        if (IsBusy)
-        {
-            return;
-        }
-
-        var marcados = AllItems().Where(item => item.IsSelected).ToList();
-        if (marcados.Count == 0)
-        {
-            ShowMessage?.Invoke("Aviso", "No has seleccionado ningún archivo para eliminar.", null);
-            return;
-        }
-
-        // Si en un grupo están marcadas TODAS las copias, se conserva la primera: enviar el
-        // grupo entero dejaría el último archivo sin hermano con el que revalidarse y se
-        // reportaría un error que el usuario no puede interpretar. Además, quedarse sin
-        // ninguna copia de un grupo de duplicados nunca es lo que se pretende.
-        var conservar = new HashSet<FileItemViewModel>();
-        foreach (var grupo in Groups)
-        {
-            if (grupo.Files.Count > 0 && grupo.Files.All(item => item.IsSelected))
-            {
-                conservar.Add(grupo.Files[0]);
-            }
-        }
-
-        var aEnviar = marcados.Where(item => !conservar.Contains(item)).ToList();
-        if (aEnviar.Count == 0)
-        {
-            ShowMessage?.Invoke(
-                "Aviso",
-                "No hay nada que enviar: de cada grupo marcado se conserva al menos una copia.",
-                null);
-            return;
-        }
-
-        if (ConfirmDelete?.Invoke(new DeletePrompt(aEnviar.Count, conservar.Count)) != true)
-        {
-            return;
-        }
-
-        var selected = aEnviar.Select(item => item.ToCandidate()).ToList();
-        var all = AllItems().Select(item => item.ToCandidate()).ToList();
-        _isPaused = false;
-        IsPaused = false;
-        IsBusy = true;
-        _operationClock.Restart();
-        _heartbeat.Start();
-        ProgressValue = 0;
-        IsProgressIndeterminate = false;
-        ProgressText = "Guardando en la papelera…";
-        StatusText = "Enviando los archivos seleccionados a la papelera…";
-        ClearLog();
-        Activity = "Iniciando el envío a la papelera";
-        ResetPhase();
-
-        _cancellation = new CancellationTokenSource();
-        var token = _cancellation.Token;
-
-        Task.Run(() =>
-        {
-            var deleter = new FileDeleter(
-                AppendLog,
-                () => _isPaused,
-                () => token.IsCancellationRequested,
-                recycleDisponible: () => RecycleBin.IsAvailable(FolderPath),
-                papeleraPropia: () => new TrashService(RutaPapeleraPropia, DateTime.Now),
-                activity: ReportActivity,
-                phase: ReportPhase);
-            DeleteOutcome outcome;
-            try
-            {
-                outcome = deleter.Delete(selected, all);
-            }
-            catch (Exception ex)
-            {
-                outcome = new DeleteOutcome { Errors = selected.Count };
-                AppendLog($"✖ ERROR inesperado: {ex}");
-            }
-
-            Post(() => FinishDelete(outcome));
-        });
-    }
-
-    private void FinishDelete(DeleteOutcome outcome)
-    {
-        _heartbeat.Stop();
-        _operationClock.Stop();
-        _progressPostPending = false;
-        _pendingProgressText = null;
-        IsBusy = false;
-        IsPaused = false;
-        _isPaused = false;
-        _cancellation?.Dispose();
-        _cancellation = null;
-        ResetPhase();
-
-        // Los archivos que ya no están en su ruta original dejan de ser candidatos, se
-        // hayan podido verificar en la Papelera o no. Mantenerlos en la lista permitía
-        // volver a seleccionarlos y fallaban después por identidad, y dejaba el resumen
-        // de bytes liberados contando archivos que ya no ocupan espacio.
-        QuitarDeLosResultados(outcome.Movidos);
-
-        var movidos = outcome.Deleted + outcome.SinVerificar;
-
-        if (outcome.Cancelled)
-        {
-            StatusText = movidos > 0
-                ? $"Envío cancelado: {movidos} archivo(s) movido(s) antes de detenerse."
-                : "Envío a la papelera cancelado.";
-            ProgressText = "Cancelado";
-        }
-        else if (outcome.Errors > 0)
-        {
-            StatusText = $"Terminado con {outcome.Errors} error(es) y {movidos} archivo(s) movido(s).";
-            ProgressText = "Con avisos";
-        }
-        else if (outcome.SinVerificar > 0)
-        {
-            StatusText = $"Terminado: {movidos} archivo(s) movido(s), {outcome.SinVerificar} sin verificar.";
-            ProgressText = "Con avisos";
-        }
-        else
-        {
-            StatusText = $"Terminado: {movidos} archivo(s) movido(s) a la papelera.";
-            ProgressText = "Listo";
-        }
-
-        MostrarResultadoDelBorrado(outcome, movidos);
-
-        // Solo se relanza el escaneo si efectivamente se movió algún archivo; de lo
-        // contrario se conservan los resultados y el registro para consultar los errores.
-        if (movidos > 0)
-        {
-            StartSearch();
-        }
-    }
-
-    /// <summary>
-    /// Redacta el aviso final separando los tres desenlaces posibles por archivo: no se
-    /// pudo mover (sigue donde estaba), se movió sin poder verificar dónde, y se movió y
-    /// se confirmó en la papelera. Mezclarlos hacía que el mensaje dijera «no se ha
-    /// borrado nada» cuando el archivo ya no estaba en su sitio.
-    /// </summary>
-    private void MostrarResultadoDelBorrado(DeleteOutcome outcome, int movidos)
-    {
-        var partes = new List<string>(3);
-
-        if (outcome.Errors > 0)
-        {
-            partes.Add(
-                $"{outcome.Errors} archivo(s) no se pudieron mover porque cambiaron o no se " +
-                "pudieron procesar. Siguen en su sitio.");
-        }
-
-        if (outcome.SinVerificar > 0)
-        {
-            partes.Add(
-                $"{outcome.SinVerificar} archivo(s) ya no están en su carpeta original, pero no " +
-                "se pudo confirmar que estén en la Papelera de reciclaje. Compruébalo en la " +
-                "Papelera antes de darlos por perdidos.");
-        }
-
-        if (movidos > 0)
-        {
-            // Se distingue lo que se pudo confirmar en la papelera de lo que solo desapareció:
-            // prometer «puedes restaurarlos» de un archivo sin verificar sería mentir.
-            var verificados = outcome.Destino == DeleteDestination.PapeleraDeLaApp
-                ? movidos
-                : outcome.Deleted;
-
-            partes.Add(outcome.Destino == DeleteDestination.PapeleraDeLaApp
-                ? $"Se guardaron {verificados} archivo(s) en la papelera propia de la aplicación:\n\n" +
-                  $"{outcome.CarpetaPapeleraPropia}\n\n" +
-                  "Cada archivo conserva su ruta original en manifiesto.txt, así que puedes " +
-                  "devolverlos a su sitio si te arrepientes."
-                : $"Se enviaron {verificados} archivo(s) a la Papelera de reciclaje. Si te " +
-                  "arrepientes, puedes restaurarlos desde la Papelera.");
-        }
-
-        if (partes.Count == 0)
-        {
-            return;
-        }
-
-        var titulo = outcome.Errors > 0 || outcome.SinVerificar > 0 ? "Aviso" : "Listo";
-        var mensaje = string.Join("\n\n", partes);
-        var abrirCarpeta = outcome.Destino == DeleteDestination.PapeleraDeLaApp
-                           && outcome.CarpetaPapeleraPropia.Length > 0
-            ? () => AbrirPapeleraPropiaSiTieneContenido(outcome.CarpetaPapeleraPropia)
-            : (Action?)null;
-
-        if (abrirCarpeta is not null)
-        {
-            mensaje += "\n\nSe abrirá esa carpeta al cerrar este aviso.";
-        }
-
-        ShowMessage?.Invoke(titulo, mensaje, abrirCarpeta);
-    }
-
-    /// <summary>
-    /// Quita de los resultados los archivos que ya no existen y descarta los grupos que se
-    /// quedan sin archivos. Sin esto, la lista seguía mostrando archivos ya movidos a la
-    /// papelera y los totales de selección no coincidían con lo que se ve.
-    /// </summary>
-    private void QuitarDeLosResultados(IReadOnlyCollection<string> rutas)
-    {
-        if (rutas.Count == 0)
-        {
-            return;
-        }
-
-        var movidas = new HashSet<string>(rutas, StringComparer.OrdinalIgnoreCase);
-
-        for (var i = Groups.Count - 1; i >= 0; i--)
-        {
-            var grupo = Groups[i];
-            for (var j = grupo.Files.Count - 1; j >= 0; j--)
-            {
-                if (movidas.Contains(grupo.Files[j].Path))
-                {
-                    grupo.Quitar(grupo.Files[j]);
-                }
-            }
-
-            if (grupo.Files.Count == 0)
-            {
-                Groups.RemoveAt(i);
-            }
-        }
-
-        RecalcularSeleccion();
-        HasResults = Groups.Count > 0;
-    }
-
-    /// <summary>Recuenta la selección tras una operación que haya retirado archivos de la lista.</summary>
-    private void RecalcularSeleccion()
-    {
-        var seleccionados = AllItems().Where(item => item.IsSelected).ToList();
-        _selectedCount = seleccionados.Count;
-        _selectedBytes = seleccionados.Sum(item => item.Size);
-        NotifySelectionTotalsChanged();
-    }
-
-    private IEnumerable<FileItemViewModel> AllItems() => Groups.SelectMany(group => group.Files);
-
-    private void ClearResults()
-    {
-        // Vaciar la colección es imprescindible: sin esto los grupos de la búsqueda
-        // anterior se quedaban en la lista y cada búsqueda acumulaba resultados, mientras
-        // los contadores de selección volvían a cero y dejaban de coincidir con las
-        // casillas que el usuario seguía viendo marcadas.
-        Groups.Clear();
-        _nextGroupIndex = 0;
-        HasResults = false;
-        SelectedCount = 0;
-        SelectedBytes = 0;
-    }
-
-    private void ResetToInitialState()
-    {
-        ClearResults();
-        ClearLog();
-        FolderPath = string.Empty;
-        Verbose = true;
-        IsProgressIndeterminate = false;
-        ProgressValue = 0;
-        ProgressText = "Listo";
-        StatusText = "Selecciona una carpeta para empezar.";
-    }
-
-    private void ClearLog() => LogCleared?.Invoke(this, EventArgs.Empty);
-
-    public event EventHandler? LogCleared;
-
-    private static LogSeverity Clasificar(string text)
-    {
-        if (text.StartsWith('✖'))
-        {
-            return LogSeverity.Error;
-        }
-
-        return text.StartsWith('⚠') ? LogSeverity.Warning : LogSeverity.Normal;
-    }
-
-    private void AppendLog(string text)
-    {
-        if (!Verbose)
-        {
-            return;
-        }
-
-        var line = new LogLine(
-            Clasificar(text),
-            $"[{DateTime.Now:HH:mm:ss}] {text}");
-
-        Post(() => LogAppended?.Invoke(this, line));
     }
 
     private void QueueProgress(ScanProgress progress)
@@ -1085,9 +1501,6 @@ public sealed class MainViewModel : ObservableObject
 
     private void Post(Action action)
     {
-        // Cerrar la ventana mientras una operación está en curso apaga el Dispatcher. Sin
-        // esta comprobación, el hilo de fondo intentaba publicar en él y la excepción
-        // quedaba sin observar (y la operación seguía corriendo hasta el final).
         if (_dispatcher.HasShutdownStarted || _dispatcher.HasShutdownFinished)
         {
             return;
@@ -1105,11 +1518,9 @@ public sealed class MainViewModel : ObservableObject
         }
         catch (TaskCanceledException)
         {
-            // El Dispatcher se cerró entre la comprobación y el envío.
         }
         catch (InvalidOperationException)
         {
-            // El Dispatcher ya no acepta trabajo.
         }
     }
 
@@ -1122,5 +1533,45 @@ public sealed class MainViewModel : ObservableObject
         SelectCopiesCommand.RaiseCanExecuteChanged();
         ClearSelectionCommand.RaiseCanExecuteChanged();
         DeleteSelectedCommand.RaiseCanExecuteChanged();
+        ExportCsvCommand.RaiseCanExecuteChanged();
+        KeepOnlyCommand.RaiseCanExecuteChanged();
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        Cancel();
+        _heartbeat.Stop();
+        _phaseTimer.Stop();
+        _pauseGate?.Dispose();
+        _cancellation?.Dispose();
+    }
+
+    private sealed class GroupComparer(SortOption option) : IComparer
+    {
+        public int Compare(object? x, object? y)
+        {
+            if (x is not DuplicateGroupViewModel a || y is not DuplicateGroupViewModel b)
+            {
+                return 0;
+            }
+
+            return option switch
+            {
+                SortOption.RecoverableSpaceDesc => CompareFallback(b.RecoverableBytes.CompareTo(a.RecoverableBytes), a, b),
+                SortOption.FileSizeDesc => CompareFallback(b.Size.CompareTo(a.Size), a, b),
+                SortOption.FileCountDesc => CompareFallback(b.FileCount.CompareTo(a.FileCount), a, b),
+                SortOption.NameAsc => string.Compare(a.DisplayName, b.DisplayName, StringComparison.OrdinalIgnoreCase),
+                _ => 0,
+            };
+        }
+
+        private static int CompareFallback(int primary, DuplicateGroupViewModel a, DuplicateGroupViewModel b)
+            => primary != 0 ? primary : string.Compare(a.DisplayName, b.DisplayName, StringComparison.OrdinalIgnoreCase);
     }
 }

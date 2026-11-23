@@ -3,8 +3,12 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:conv="clr-namespace:DuplicadosApp.Converters"
         Title="Buscador de Archivos Duplicados"
-        Height="760" Width="1000" MinHeight="560" MinWidth="820"
+        Height="800" Width="1080" MinHeight="580" MinWidth="860"
         WindowStartupLocation="CenterScreen"
+        AllowDrop="True"
+        PreviewDragOver="Window_PreviewDragOver"
+        Drop="Window_Drop"
+        PreviewKeyDown="Window_PreviewKeyDown"
         FontFamily="{StaticResource AppFontFamily}"
         FontSize="{StaticResource FontSizeBody}"
         Foreground="{DynamicResource TextPrimaryBrush}"
@@ -12,20 +16,24 @@
         UseLayoutRounding="True"
         TextOptions.TextFormattingMode="Display">
 
+    <Window.InputBindings>
+        <KeyBinding Key="O" Modifiers="Control" Command="{Binding SelectFolderCommand}" />
+        <KeyBinding Key="F5" Command="{Binding StartSearchCommand}" />
+        <KeyBinding Key="Escape" Command="{Binding CancelCommand}" />
+        <KeyBinding Key="Delete" Command="{Binding DeleteSelectedCommand}" />
+    </Window.InputBindings>
+
     <Window.Resources>
         <ResourceDictionary>
             <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
             <conv:InverseBooleanConverter x:Key="InverseBoolean" />
             <conv:InverseBooleanToVisibilityConverter x:Key="InverseBoolToVisibility" />
 
-            <!--
-                Contenedor de una fila de archivo. Es un estilo IMPLÍCITO (sin x:Key)
-                para ListViewItem: aplicarlo por clave a un ItemsControl falla, porque
-                ese control genera ContentPresenter y no ListViewItem.
-            -->
-            <Style TargetType="ListViewItem">
+            <!-- Contenedor de fila de archivo -->
+            <Style x:Key="FileRowItemStyle" TargetType="ListViewItem">
                 <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-                <Setter Property="Padding" Value="2,1" />
+                <Setter Property="Padding" Value="6,4" />
+                <Setter Property="Margin" Value="0,1" />
                 <Setter Property="Focusable" Value="False" />
                 <Setter Property="Background" Value="Transparent" />
                 <Setter Property="Template">
@@ -33,11 +41,14 @@
                         <ControlTemplate TargetType="ListViewItem">
                             <Border x:Name="Row"
                                     Background="{TemplateBinding Background}"
-                                    CornerRadius="4"
+                                    CornerRadius="5"
                                     Padding="{TemplateBinding Padding}">
                                 <ContentPresenter />
                             </Border>
                             <ControlTemplate.Triggers>
+                                <DataTrigger Binding="{Binding IsSelected}" Value="True">
+                                    <Setter TargetName="Row" Property="Background" Value="{DynamicResource SurfaceSelectedBrush}" />
+                                </DataTrigger>
                                 <Trigger Property="IsMouseOver" Value="True">
                                     <Setter TargetName="Row" Property="Background" Value="{DynamicResource SurfaceHoverBrush}" />
                                 </Trigger>
@@ -47,13 +58,11 @@
                 </Setter>
             </Style>
 
-            <!--
-                Estilo IMPLÍCITO para todos los ToolTip de la ventana: limita el ancho
-                y ajusta el texto en varias líneas, de modo que ningún tooltip (de
-                botones o checkboxes) sobresalga del ancho que ocupa la aplicación.
-            -->
             <Style TargetType="ToolTip">
                 <Setter Property="MaxWidth" Value="380" />
+                <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+                <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+                <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
                 <Setter Property="ContentTemplate">
                     <Setter.Value>
                         <DataTemplate>
@@ -76,7 +85,7 @@
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <!-- Panel superior: selección de carpeta y opciones -->
+        <!-- Panel superior: carpeta, arrastrar y soltar, opciones y tema -->
         <Border Grid.Row="0"
                 Background="{DynamicResource SurfaceBrush}"
                 BorderBrush="{DynamicResource BorderBrush}"
@@ -90,11 +99,17 @@
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
-                <StackPanel Grid.Row="0" Orientation="Horizontal">
-                    <Button Command="{Binding SelectFolderCommand}"
+                <Grid Grid.Row="0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <Button Grid.Column="0"
+                            Command="{Binding SelectFolderCommand}"
                             Style="{StaticResource ActionButton}"
-                            HorizontalContentAlignment="Center"
-                            ToolTip="Abre un diálogo para elegir la carpeta que se analizará en busca de archivos duplicados.">
+                            ToolTip="Elige la carpeta a analizar (Ctrl+O). También puedes arrastrar cualquier carpeta sobre esta ventana.">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Text="{StaticResource IconFolder}"
                                        FontFamily="{StaticResource IconFontFamily}"
@@ -104,45 +119,65 @@
                             <TextBlock Text="Seleccionar carpeta" VerticalAlignment="Center" />
                         </StackPanel>
                     </Button>
-                    <TextBlock Text="{Binding FolderPath}"
-                               VerticalAlignment="Center"
-                               Margin="10,0,0,0"
-                               FontSize="{StaticResource FontSizeBody}"
-                               Foreground="{DynamicResource AccentBrush}"
-                               TextTrimming="CharacterEllipsis"
-                               ToolTip="{Binding FolderPath}"
-                               MaxWidth="620" />
-                </StackPanel>
 
-                <!--
-                    El criterio es único (tamaño + extensión + contenido), así que ya no hay
-                    casilla de modo: la fila ocupa el ancho disponible para que la descripción
-                    se ajuste en lugar de recortarse.
-                -->
-                <Grid Grid.Row="1" Margin="0,12,0,0">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
-                    <CheckBox Grid.Column="0"
-                              Content="Modo detallado"
+                    <Grid Grid.Column="1" Margin="2,0,8,0">
+                        <TextBox x:Name="FolderPathBox"
+                                 Text="{Binding FolderPath, UpdateSourceTrigger=PropertyChanged}"
+                                 Style="{StaticResource AppTextBox}"
+                                 IsReadOnly="{Binding IsBusy}"
+                                 KeyDown="FolderPathBox_KeyDown"
+                                 ToolTip="Ruta de la carpeta a escanear. Puedes pegar una ruta y pulsar Enter, o arrastrar una carpeta aquí." />
+                        <TextBlock Text="Pega una ruta o arrastra una carpeta sobre la ventana…"
+                                   Style="{StaticResource MutedText}"
+                                   IsHitTestVisible="False"
+                                   VerticalAlignment="Center"
+                                   Margin="11,0,0,0"
+                                   Visibility="{Binding HasFolder, Converter={StaticResource InverseBoolToVisibility}}" />
+                    </Grid>
+
+                    <Button Grid.Column="2"
+                            Command="{Binding ToggleThemeCommand}"
+                            Style="{StaticResource ActionButton}"
+                            Margin="0"
+                            Padding="10,7"
+                            ToolTip="{Binding ThemeToggleTooltip}">
+                        <TextBlock Text="{StaticResource IconTheme}"
+                                   FontFamily="{StaticResource IconFontFamily}"
+                                   FontSize="15"
+                                   VerticalAlignment="Center" />
+                    </Button>
+                </Grid>
+
+                <WrapPanel Grid.Row="1" Margin="0,10,0,0" Orientation="Horizontal">
+                    <CheckBox Content="Ignorar vacíos (0 B)"
+                              Style="{StaticResource AppCheckBox}"
+                              IsChecked="{Binding IgnoreEmptyFiles}"
+                              IsEnabled="{Binding IsIdle}"
+                              Margin="0,2,18,0"
+                              ToolTip="Omite archivos de 0 bytes que no liberan espacio al eliminarse." />
+                    <CheckBox Content="Exigir misma extensión"
+                              Style="{StaticResource AppCheckBox}"
+                              IsChecked="{Binding RequireSameExtension}"
+                              IsEnabled="{Binding IsIdle}"
+                              Margin="0,2,18,0"
+                              ToolTip="Si está marcado, solo compara archivos con la misma extensión (más rápido). Desmárcalo para detectar copias renombradas con distinta extensión." />
+                    <CheckBox Content="Omitir ocultos y sistema"
+                              Style="{StaticResource AppCheckBox}"
+                              IsChecked="{Binding IgnoreHiddenAndSystem}"
+                              IsEnabled="{Binding IsIdle}"
+                              Margin="0,2,18,0"
+                              ToolTip="Ignora archivos y carpetas con atributo Oculto o Sistema." />
+                    <CheckBox Content="Registro detallado"
                               Style="{StaticResource AppCheckBox}"
                               IsChecked="{Binding Verbose}"
-                              VerticalAlignment="Center"
-                              ToolTip="Al marcar, escribe información detallada del proceso y el latido de estado en el registro de actividad. Al desmarcar, pausa la escritura de nuevas líneas en el registro." />
-                    <TextBlock Grid.Column="1"
-                               Text="Criterio: mismo tamaño y misma extensión, también en todas las subcarpetas. Solo esas coincidencias se comparan después byte a byte."
-                               Style="{StaticResource MutedText}"
-                               Margin="26,0,0,0"
-                               TextWrapping="Wrap"
-                               VerticalAlignment="Center"
-                               ToolTip="Los nombres no tienen por qué coincidir: dos copias pueden llamarse distinto. El contenido solo se compara cuando el tamaño y la extensión coinciden." />
-                </Grid>
+                              Margin="0,2,0,0"
+                              ToolTip="Escribe el detalle del análisis y el latido periódico en el panel de actividad." />
+                </WrapPanel>
             </Grid>
         </Border>
 
-        <!-- Barra de progreso -->
-        <Grid Grid.Row="1" Margin="0,0,0,10">
+        <!-- Barra de progreso global -->
+        <Grid Grid.Row="1" Margin="0,0,0,6">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
@@ -153,45 +188,162 @@
                          Minimum="0" Maximum="100"
                          IsIndeterminate="{Binding IsProgressIndeterminate}"
                          Value="{Binding ProgressValue, Mode=OneWay}" />
-            <TextBlock Grid.Column="1" Text="{Binding ProgressText}"
+            <TextBlock Grid.Column="1"
+                       Text="{Binding ProgressText}"
                        Margin="12,0,0,0"
                        VerticalAlignment="Center"
-                       MinWidth="260" TextAlignment="Right"
+                       MinWidth="240"
+                       TextAlignment="Right"
                        Style="{StaticResource SecondaryText}" />
         </Grid>
 
-        <!-- Estado -->
-        <TextBlock Grid.Row="2" Text="{Binding StatusText}"
-                   Margin="3,0,0,10"
-                   TextWrapping="Wrap"
-                   Style="{StaticResource SecondaryText}" />
+        <!-- Estado y estadísticas del último escaneo -->
+        <Grid Grid.Row="2" Margin="2,0,2,8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0"
+                       Text="{Binding StatusText}"
+                       TextWrapping="Wrap"
+                       VerticalAlignment="Center"
+                       Style="{StaticResource SecondaryText}" />
+            <Border Grid.Column="1"
+                    Background="{DynamicResource AccentSubtleBrush}"
+                    CornerRadius="10"
+                    Padding="10,3"
+                    Margin="12,0,0,0"
+                    VerticalAlignment="Center"
+                    Visibility="{Binding HasScanStats, Converter={StaticResource BoolToVisibility}}">
+                <TextBlock Text="{Binding LastScanStatsText}"
+                           FontSize="{StaticResource FontSizeCaption}"
+                           Foreground="{DynamicResource AccentBrush}"
+                           FontWeight="SemiBold" />
+            </Border>
+        </Grid>
 
-        <!-- Resultados -->
+        <!-- Panel principal de resultados -->
         <Border Grid.Row="3"
                 Background="{DynamicResource SurfaceBrush}"
                 BorderBrush="{DynamicResource BorderBrush}"
                 BorderThickness="1"
                 CornerRadius="8"
-                Padding="4">
+                Padding="6">
             <Grid>
-                <!--
-                    ListView virtualizada: los contenedores se crean solo para lo que
-                    se ve. El encabezado de cada grupo lo dibuja la propia lista, así
-                    que no hay un panel por grupo ni todos los elementos a la vez.
-                -->
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <!-- Barra de filtro, ordenación y exportación (visible cuando hay resultados) -->
+                <Border Grid.Row="0"
+                        BorderBrush="{DynamicResource DividerBrush}"
+                        BorderThickness="0,0,0,1"
+                        Padding="6,4,6,8"
+                        Margin="0,0,0,4"
+                        Visibility="{Binding HasResults, Converter={StaticResource BoolToVisibility}}">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" MaxWidth="380" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+
+                        <Grid Grid.Column="0">
+                            <TextBox x:Name="SearchFilterBox"
+                                     Text="{Binding SearchFilter, UpdateSourceTrigger=PropertyChanged}"
+                                     Style="{StaticResource AppTextBox}"
+                                     Padding="28,5,26,5"
+                                     ToolTip="Filtra grupos por nombre de archivo, extensión o ruta (Ctrl+F)." />
+                            <TextBlock Text="{StaticResource IconFilter}"
+                                       FontFamily="{StaticResource IconFontFamily}"
+                                       FontSize="12"
+                                       Foreground="{DynamicResource TextMutedBrush}"
+                                       IsHitTestVisible="False"
+                                       VerticalAlignment="Center"
+                                       HorizontalAlignment="Left"
+                                       Margin="9,0,0,0" />
+                            <TextBlock Text="Filtrar por nombre o ruta… (Ctrl+F)"
+                                       IsHitTestVisible="False"
+                                       VerticalAlignment="Center"
+                                       Margin="29,0,0,0">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock" BasedOn="{StaticResource MutedText}">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding SearchFilter}" Value="">
+                                                <Setter Property="Visibility" Value="Visible" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                            <Button Command="{Binding ClearFilterCommand}"
+                                    Style="{StaticResource SecondaryButton}"
+                                    HorizontalAlignment="Right"
+                                    VerticalAlignment="Center"
+                                    Padding="5,2"
+                                    Margin="0,0,3,0"
+                                    Visibility="{Binding HasSearchFilter, Converter={StaticResource BoolToVisibility}}"
+                                    ToolTip="Limpiar filtro">
+                                <TextBlock Text="{StaticResource IconCancel}"
+                                           FontFamily="{StaticResource IconFontFamily}"
+                                           FontSize="10" />
+                            </Button>
+                        </Grid>
+
+                        <TextBlock Grid.Column="1"
+                                   Text="{Binding VisibleGroupCount, StringFormat={}{0:N0} visible(s)}"
+                                   Style="{StaticResource CaptionText}"
+                                   VerticalAlignment="Center"
+                                   Margin="10,0,0,0" />
+
+                        <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,8,0">
+                            <TextBlock Text="Ordenar:"
+                                       Style="{StaticResource CaptionText}"
+                                       VerticalAlignment="Center"
+                                       Margin="0,0,6,0" />
+                            <ComboBox ItemsSource="{Binding SortOptions}"
+                                      SelectedValue="{Binding SelectedSortOption}"
+                                      SelectedValuePath="Value"
+                                      DisplayMemberPath="Label"
+                                      Style="{StaticResource AppComboBox}"
+                                      MinWidth="195" />
+                        </StackPanel>
+
+                        <Button Grid.Column="4"
+                                Command="{Binding ExportCsvCommand}"
+                                Style="{StaticResource SecondaryButton}"
+                                Margin="0"
+                                ToolTip="Exporta la lista completa de duplicados a un archivo CSV.">
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="{StaticResource IconExport}"
+                                           FontFamily="{StaticResource IconFontFamily}"
+                                           FontSize="13"
+                                           Margin="0,0,6,0"
+                                           VerticalAlignment="Center" />
+                                <TextBlock Text="Exportar CSV" VerticalAlignment="Center" FontSize="{StaticResource FontSizeSmall}" />
+                            </StackPanel>
+                        </Button>
+                    </Grid>
+                </Border>
+
+                <!-- Lista virtualizada de tarjetas de grupos (sin capa extra de PropertyGroupDescription) -->
                 <ListView x:Name="ResultadosLista"
-                          ItemsSource="{Binding GroupedResults}"
+                          Grid.Row="1"
+                          ItemsSource="{Binding ResultsView}"
                           Background="Transparent"
                           BorderThickness="0"
-                          Padding="6"
+                          Padding="4"
                           SelectionMode="Single"
                           IsSynchronizedWithCurrentItem="False"
                           ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                           ScrollViewer.VerticalScrollBarVisibility="Auto"
                           ScrollViewer.CanContentScroll="True"
                           VirtualizingPanel.IsVirtualizing="True"
-                          VirtualizingPanel.VirtualizationMode="Recycling"
-                          VirtualizingPanel.IsVirtualizingWhenGrouping="True">
+                          VirtualizingPanel.VirtualizationMode="Recycling">
                     <ListView.ItemsPanel>
                         <ItemsPanelTemplate>
                             <VirtualizingStackPanel />
@@ -212,170 +364,273 @@
                             </Setter>
                         </Style>
                     </ListView.ItemContainerStyle>
-                    <ListView.GroupStyle>
-                        <GroupStyle>
-                            <GroupStyle.HeaderTemplate>
-                                <DataTemplate>
-                                    <StackPanel Margin="2,0,2,6">
-                                        <TextBlock Text="{Binding Name.Header}"
-                                                   Style="{StaticResource TitleText}" />
-                                        <TextBlock Text="{Binding Name.Summary}"
-                                                   Style="{StaticResource CaptionText}"
-                                                   Margin="0,3,0,0" />
-                                    </StackPanel>
-                                </DataTemplate>
-                            </GroupStyle.HeaderTemplate>
-                            <GroupStyle.Panel>
-                                <ItemsPanelTemplate>
-                                    <VirtualizingStackPanel />
-                                </ItemsPanelTemplate>
-                            </GroupStyle.Panel>
-                        </GroupStyle>
-                    </ListView.GroupStyle>
                     <ListView.ItemTemplate>
                         <DataTemplate>
                             <Border Background="{DynamicResource SurfaceAltBrush}"
                                     BorderBrush="{DynamicResource BorderBrush}"
                                     BorderThickness="1"
-                                    CornerRadius="6"
-                                    Padding="10,6">
-                                <!--
-                                    MaxHeight acota la altura cuando un mismo grupo tiene
-                                    cientos o miles de archivos idénticos, permitiendo que
-                                    VirtualizingStackPanel recicle las filas en lugar de
-                                    instanciar todos los controles de golpe.
-                                -->
-                                <ListView ItemsSource="{Binding Files}"
-                                          MaxHeight="260"
-                                          Background="Transparent"
-                                          BorderThickness="0"
-                                          Padding="0"
-                                          SelectionMode="Single"
-                                          IsSynchronizedWithCurrentItem="False"
-                                          ScrollViewer.HorizontalScrollBarVisibility="Disabled"
-                                          ScrollViewer.VerticalScrollBarVisibility="Auto"
-                                          ScrollViewer.CanContentScroll="True"
-                                          VirtualizingPanel.IsVirtualizing="True"
-                                          VirtualizingPanel.VirtualizationMode="Recycling">
-                                    <ListView.ItemsPanel>
-                                        <ItemsPanelTemplate>
-                                            <VirtualizingStackPanel />
-                                        </ItemsPanelTemplate>
-                                    </ListView.ItemsPanel>
-                                    <ListView.ItemTemplate>
-                                        <DataTemplate>
-                                            <Grid Margin="0,2">
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="Auto" />
-                                                    <ColumnDefinition Width="*" />
-                                                    <ColumnDefinition Width="Auto" />
-                                                </Grid.ColumnDefinitions>
-                                                <CheckBox Grid.Column="0"
-                                                          Style="{StaticResource AppCheckBox}"
-                                                          IsChecked="{Binding IsSelected, Mode=TwoWay}"
-                                                          VerticalAlignment="Center"
-                                                          ToolTip="Al marcar, selecciona este archivo para eliminarlo (se envía a la Papelera al pulsar «Eliminar archivos seleccionados»). Al desmarcar, el archivo no se elimina." />
-                                                <TextBlock Grid.Column="1"
-                                                           Text="{Binding Path}"
-                                                           Margin="8,0,10,0"
-                                                           TextWrapping="Wrap"
-                                                           Cursor="Hand"
-                                                           ToolTip="{Binding Path}"
-                                                           MouseLeftButtonDown="RutaArchivo_MouseLeftButtonDown">
-                                                    <!--
-                                                        El doble clic se engancha en la ruta y no en
-                                                        la fila: así la casilla de selección sigue
-                                                        marcando y desmarcando sin abrir el archivo.
-                                                        El resaltado al pasar el ratón avisa de que
-                                                        la línea es pulsable.
-                                                    -->
-                                                    <TextBlock.Style>
-                                                        <Style TargetType="TextBlock">
-                                                            <Style.Triggers>
-                                                                <Trigger Property="IsMouseOver" Value="True">
-                                                                    <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
-                                                                </Trigger>
-                                                            </Style.Triggers>
-                                                        </Style>
-                                                    </TextBlock.Style>
-                                                </TextBlock>
-                                                <TextBlock Grid.Column="2"
-                                                           Text="{Binding SizeText}"
-                                                           VerticalAlignment="Center"
-                                                           Margin="0,0,4,0"
-                                                           Style="{StaticResource MutedText}" />
-                                            </Grid>
-                                        </DataTemplate>
-                                    </ListView.ItemTemplate>
-                                </ListView>
+                                    CornerRadius="7"
+                                    Padding="12,9">
+                                <Grid>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+
+                                    <!-- Cabecera integrada de la tarjeta de grupo -->
+                                    <Grid Grid.Row="0" Margin="0,0,0,8">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel Grid.Column="0">
+                                            <TextBlock Text="{Binding Header}"
+                                                       Style="{StaticResource TitleText}"
+                                                       TextTrimming="CharacterEllipsis" />
+                                            <TextBlock Text="{Binding Summary}"
+                                                       Style="{StaticResource CaptionText}"
+                                                       Margin="0,2,0,0" />
+                                        </StackPanel>
+                                        <Border Grid.Column="1"
+                                                Background="{DynamicResource AccentSubtleBrush}"
+                                                CornerRadius="10"
+                                                Padding="9,3"
+                                                VerticalAlignment="Center"
+                                                Margin="8,0,0,0"
+                                                ToolTip="Espacio recuperable en este grupo">
+                                            <TextBlock Text="{Binding RecoverableText}"
+                                                       FontSize="{StaticResource FontSizeCaption}"
+                                                       FontWeight="SemiBold"
+                                                       Foreground="{DynamicResource AccentBrush}" />
+                                        </Border>
+                                    </Grid>
+
+                                    <!-- Filas virtualizadas de archivos dentro del grupo -->
+                                    <ListView Grid.Row="1"
+                                              ItemsSource="{Binding Files}"
+                                              ItemContainerStyle="{StaticResource FileRowItemStyle}"
+                                              MaxHeight="280"
+                                              Background="Transparent"
+                                              BorderThickness="0"
+                                              Padding="0"
+                                              SelectionMode="Single"
+                                              IsSynchronizedWithCurrentItem="False"
+                                              ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                              ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                              ScrollViewer.CanContentScroll="True"
+                                              VirtualizingPanel.IsVirtualizing="True"
+                                              VirtualizingPanel.VirtualizationMode="Recycling">
+                                        <ListView.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <VirtualizingStackPanel />
+                                            </ItemsPanelTemplate>
+                                        </ListView.ItemsPanel>
+                                        <ListView.ItemTemplate>
+                                            <DataTemplate>
+                                                <Grid Tag="{Binding DataContext, RelativeSource={RelativeSource AncestorType=Window}}">
+                                                    <Grid.ContextMenu>
+                                                        <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
+                                                            <MenuItem Header="Abrir archivo"
+                                                                      Command="{Binding PlacementTarget.Tag.OpenFileCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                      CommandParameter="{Binding}" />
+                                                            <MenuItem Header="Mostrar en el Explorador"
+                                                                      Command="{Binding PlacementTarget.Tag.RevealInExplorerCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                      CommandParameter="{Binding}" />
+                                                            <Separator />
+                                                            <MenuItem Header="Conservar solo este archivo (marcar el resto)"
+                                                                      Command="{Binding PlacementTarget.Tag.KeepOnlyCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                      CommandParameter="{Binding}" />
+                                                            <MenuItem Header="Copiar ruta completa"
+                                                                      Command="{Binding PlacementTarget.Tag.CopyPathCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}"
+                                                                      CommandParameter="{Binding}" />
+                                                        </ContextMenu>
+                                                    </Grid.ContextMenu>
+
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="Auto" />
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+
+                                                    <CheckBox Grid.Column="0"
+                                                              Style="{StaticResource AppCheckBox}"
+                                                              IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                                              VerticalAlignment="Center"
+                                                              ToolTip="Marcar para enviar a la papelera" />
+
+                                                    <TextBlock Grid.Column="1"
+                                                               Text="{Binding Path}"
+                                                               Margin="8,0,12,0"
+                                                               TextWrapping="Wrap"
+                                                               VerticalAlignment="Center"
+                                                               Cursor="Hand"
+                                                               ToolTip="Doble clic para abrir · Clic derecho para más opciones"
+                                                               MouseLeftButtonDown="RutaArchivo_MouseLeftButtonDown">
+                                                        <TextBlock.Style>
+                                                            <Style TargetType="TextBlock">
+                                                                <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+                                                                <Style.Triggers>
+                                                                    <Trigger Property="IsMouseOver" Value="True">
+                                                                        <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+                                                                    </Trigger>
+                                                                </Style.Triggers>
+                                                            </Style>
+                                                        </TextBlock.Style>
+                                                    </TextBlock>
+
+                                                    <TextBlock Grid.Column="2"
+                                                               Text="{Binding ModifiedText}"
+                                                               VerticalAlignment="Center"
+                                                               Margin="0,0,12,0"
+                                                               Style="{StaticResource CaptionText}"
+                                                               ToolTip="Fecha de última modificación" />
+
+                                                    <TextBlock Grid.Column="3"
+                                                               Text="{Binding SizeText}"
+                                                               VerticalAlignment="Center"
+                                                               Margin="0,0,6,0"
+                                                               Style="{StaticResource MutedText}" />
+
+                                                    <Button Grid.Column="4"
+                                                            Command="{Binding DataContext.RevealInExplorerCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                            CommandParameter="{Binding}"
+                                                            Style="{StaticResource SecondaryButton}"
+                                                            Padding="5,3"
+                                                            Margin="0"
+                                                            ToolTip="Mostrar archivo en el Explorador">
+                                                        <TextBlock Text="{StaticResource IconOpenLocation}"
+                                                                   FontFamily="{StaticResource IconFontFamily}"
+                                                                   FontSize="12" />
+                                                    </Button>
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ListView.ItemTemplate>
+                                    </ListView>
+                                </Grid>
                             </Border>
                         </DataTemplate>
                     </ListView.ItemTemplate>
                 </ListView>
 
-                <TextBlock Text="Selecciona una carpeta y pulsa «Buscar duplicados»."
-                           Style="{StaticResource MutedText}"
-                           FontSize="{StaticResource FontSizeBody}"
-                           HorizontalAlignment="Center" VerticalAlignment="Center"
-                           Visibility="{Binding HasResults, Converter={StaticResource InverseBoolToVisibility}}" />
+                <!-- Estado vacío inicial -->
+                <StackPanel Grid.Row="1"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            Visibility="{Binding ShowEmptyPlaceholder, Converter={StaticResource BoolToVisibility}}">
+                    <TextBlock Text="{StaticResource IconFolder}"
+                               FontFamily="{StaticResource IconFontFamily}"
+                               FontSize="36"
+                               Foreground="{DynamicResource TextMutedBrush}"
+                               HorizontalAlignment="Center"
+                               Margin="0,0,0,10" />
+                    <TextBlock Text="Selecciona o arrastra una carpeta y pulsa «Buscar duplicados»."
+                               Style="{StaticResource SecondaryText}"
+                               HorizontalAlignment="Center" />
+                    <TextBlock Text="Búsqueda paralela con huella rápida y verificación exacta byte a byte."
+                               Style="{StaticResource CaptionText}"
+                               HorizontalAlignment="Center"
+                               Margin="0,4,0,0" />
+                </StackPanel>
+
+                <!-- Estado sin coincidencias del filtro -->
+                <StackPanel Grid.Row="1"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            Visibility="{Binding ShowNoFilterMatch, Converter={StaticResource BoolToVisibility}}">
+                    <TextBlock Text="Ningún grupo coincide con el filtro actual."
+                               Style="{StaticResource SecondaryText}"
+                               HorizontalAlignment="Center" />
+                    <Button Content="Limpiar filtro"
+                            Command="{Binding ClearFilterCommand}"
+                            Style="{StaticResource SecondaryButton}"
+                            HorizontalAlignment="Center"
+                            Margin="0,8,0,0" />
+                </StackPanel>
             </Grid>
         </Border>
 
-        <!-- Actividad -->
-        <GroupBox Grid.Row="4" Header="Actividad" Margin="0,10,0,0"
-                  Padding="6,4"
-                  FontFamily="{StaticResource AppFontFamily}"
-                  Foreground="{DynamicResource TextSecondaryBrush}">
-            <DockPanel LastChildFill="True">
-                <!--
-                    Barra de progreso de la ACCIÓN en curso: se reutiliza y cambia según
-                    la fase activa (recorrido, agrupado por tamaño, comparación,
-                    verificación, envío a la papelera…). Se distingue de la barra global
-                    de arriba, que mide el avance total de la operación.
-                -->
-                <Grid DockPanel.Dock="Top" Margin="4,2,4,6">
+        <!-- Panel Actividad plegable con barra de fase -->
+        <Border Grid.Row="4"
+                Background="{DynamicResource SurfaceBrush}"
+                BorderBrush="{DynamicResource BorderBrush}"
+                BorderThickness="1"
+                CornerRadius="8"
+                Padding="10,7"
+                Margin="0,10,0,0">
+            <StackPanel>
+                <Grid>
                     <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
-                    <ProgressBar Grid.Column="0"
+
+                    <Button Grid.Column="0"
+                            Command="{Binding ToggleActivityCommand}"
+                            Style="{StaticResource SecondaryButton}"
+                            Padding="6,2"
+                            Margin="0,0,10,0"
+                            ToolTip="Mostrar u ocultar el registro de actividad">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock FontFamily="{StaticResource IconFontFamily}"
+                                       FontSize="10"
+                                       Margin="0,0,6,0"
+                                       VerticalAlignment="Center">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Text" Value="{StaticResource IconChevronUp}" />
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding IsActivityExpanded}" Value="True">
+                                                <Setter Property="Text" Value="{StaticResource IconChevronDown}" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                            <TextBlock Text="Actividad" FontWeight="SemiBold" FontSize="{StaticResource FontSizeSmall}" VerticalAlignment="Center" />
+                        </StackPanel>
+                    </Button>
+
+                    <ProgressBar Grid.Column="1"
                                  Style="{StaticResource AppProgressBar}"
-                                 Height="6"
+                                 Height="5"
                                  VerticalAlignment="Center"
                                  Minimum="0" Maximum="100"
                                  IsIndeterminate="{Binding IsPhaseIndeterminate}"
                                  Value="{Binding PhaseValue, Mode=OneWay}" />
-                    <TextBlock Grid.Column="1"
+
+                    <TextBlock Grid.Column="2"
                                Text="{Binding PhaseLabel}"
-                               Margin="10,0,0,0"
+                               Margin="10,0,2,0"
                                VerticalAlignment="Center"
-                               MinWidth="220" TextAlignment="Right"
+                               MinWidth="210"
+                               TextAlignment="Right"
                                Style="{StaticResource CaptionText}" />
                 </Grid>
 
-                <!--
-                    RichTextBox (no TextBox) porque cada línea lleva su propio color.
-                    Sin binding de Text: la vista AÑADE cada línea al final desde el código
-                    (ver MainWindow.xaml.cs). Antes se reconstruía todo el texto en cada
-                    línea, y el coste crecía con el número de líneas.
-                -->
                 <RichTextBox x:Name="RegistroTexto"
                              IsReadOnly="True"
-                             Height="110"
+                             Height="104"
+                             Margin="0,6,0,0"
                              FontFamily="{StaticResource MonoFontFamily}"
                              FontSize="11"
-                             BorderThickness="0"
-                             Padding="4"
+                             BorderThickness="1"
+                             BorderBrush="{DynamicResource DividerBrush}"
+                             Padding="6,4"
                              Foreground="{DynamicResource TextPrimaryBrush}"
                              VerticalScrollBarVisibility="Auto"
                              HorizontalScrollBarVisibility="Auto"
-                             Background="{DynamicResource SurfaceAltBrush}" />
-            </DockPanel>
-        </GroupBox>
+                             Background="{DynamicResource SurfaceAltBrush}"
+                             Visibility="{Binding IsActivityExpanded, Converter={StaticResource BoolToVisibility}}" />
+            </StackPanel>
+        </Border>
 
-        <!-- Acciones -->
+        <!-- Barra principal de acciones -->
         <Grid Grid.Row="5" Margin="0,12,0,0">
             <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
@@ -386,9 +641,8 @@
 
             <Button Grid.Column="0"
                     Command="{Binding StartSearchCommand}"
-                    Style="{StaticResource ActionButton}"
-                    HorizontalContentAlignment="Center"
-                    ToolTip="Inicia el análisis de la carpeta seleccionada y muestra los grupos de archivos duplicados.">
+                    Style="{StaticResource PrimaryButton}"
+                    ToolTip="Inicia el análisis de la carpeta seleccionada (F5).">
                 <StackPanel Orientation="Horizontal">
                     <TextBlock Text="{StaticResource IconSearch}"
                                FontFamily="{StaticResource IconFontFamily}"
@@ -399,64 +653,90 @@
                 </StackPanel>
             </Button>
 
-            <Button Grid.Column="1" Content="Seleccionar copias (automático)"
+            <ComboBox Grid.Column="1"
+                      ItemsSource="{Binding SelectionStrategies}"
+                      SelectedValue="{Binding SelectedStrategy}"
+                      SelectedValuePath="Value"
+                      DisplayMemberPath="Label"
+                      Style="{StaticResource AppComboBox}"
+                      IsEnabled="{Binding HasResults}"
+                      MinWidth="180"
+                      Margin="0,0,6,0"
+                      ToolTip="Elige qué copia conservar en cada grupo al pulsar «Seleccionar copias»." />
+
+            <Button Grid.Column="2"
+                    Content="Seleccionar copias"
                     Command="{Binding SelectCopiesCommand}"
                     Style="{StaticResource ActionButton}"
-                    HorizontalContentAlignment="Center"
-                    ToolTip="Marca automáticamente los archivos sobrantes de cada grupo (conserva una sola copia) para poder eliminarlos." />
-            <Button Grid.Column="2" Content="Quitar selección"
+                    ToolTip="Marca automáticamente las copias sobrantes de cada grupo aplicando la estrategia elegida." />
+
+            <Button Grid.Column="3"
+                    Content="Quitar selección"
                     Command="{Binding ClearSelectionCommand}"
                     Style="{StaticResource ActionButton}"
-                    HorizontalContentAlignment="Center"
-                    ToolTip="Desmarca todos los archivos seleccionados y deja el resumen de selección a cero." />
-            <Button Grid.Column="3" Content="{Binding PauseButtonText}"
+                    ToolTip="Desmarca todos los archivos seleccionados." />
+
+            <Button Grid.Column="4"
+                    Content="{Binding PauseButtonText}"
                     Command="{Binding TogglePauseCommand}"
                     Style="{StaticResource ActionButton}"
-                    HorizontalContentAlignment="Center"
                     Margin="0"
-                    ToolTip="Pausa o reanuda el análisis en curso sin perder el progreso." />
+                    ToolTip="Pausa o reanuda el proceso en curso al instante." />
 
-            <TextBlock Grid.Column="4" Text="{Binding SelectionSummary}"
-                       VerticalAlignment="Center" Margin="14,0"
+            <TextBlock Grid.Column="5"
+                       Text="{Binding SelectionSummary}"
+                       VerticalAlignment="Center"
+                       Margin="12,0"
+                       TextTrimming="CharacterEllipsis"
                        Style="{StaticResource SecondaryText}" />
 
-            <StackPanel Grid.Column="5" Orientation="Horizontal">
+            <StackPanel Grid.Column="6" Orientation="Horizontal">
                 <Button Content="Cancelar"
                         Command="{Binding CancelCommand}"
                         Style="{StaticResource ActionButton}"
-                        HorizontalContentAlignment="Center"
                         Visibility="{Binding IsBusy, Converter={StaticResource BoolToVisibility}}"
-                        ToolTip="Detiene de inmediato la operación en curso (si es una búsqueda, devuelve la ventana a su estado inicial; si es un borrado, detiene el envío a la papelera)." />
+                        ToolTip="Detiene de inmediato la operación en curso (Esc)." />
                 <Button Command="{Binding DeleteSelectedCommand}"
                         Style="{StaticResource DangerButton}"
-                        ToolTip="Envía a la Papelera todos los archivos marcados con la casilla de selección.">
+                        ToolTip="Envía a la papelera los archivos marcados, revalidando cada uno antes de moverlo (Supr).">
                     <StackPanel Orientation="Horizontal">
                         <TextBlock Text="{StaticResource IconTrash}"
                                    FontFamily="{StaticResource IconFontFamily}"
                                    FontSize="15"
                                    Margin="0,0,8,0"
                                    VerticalAlignment="Center" />
-                        <TextBlock Text="Eliminar archivos seleccionados" VerticalAlignment="Center" />
+                        <TextBlock Text="Eliminar seleccionados" VerticalAlignment="Center" />
                     </StackPanel>
                 </Button>
             </StackPanel>
         </Grid>
 
-        <!-- Papelera propia: se usa cuando la del sistema no está disponible -->
-        <Grid Grid.Row="6" Margin="0,8,0,0">
-            <Button HorizontalAlignment="Left"
+        <!-- Barra inferior: papelera propia y atajos -->
+        <Grid Grid.Row="6" Margin="0,6,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <Button Grid.Column="0"
+                    HorizontalAlignment="Left"
                     Command="{Binding AbrirPapeleraPropiaCommand}"
                     Style="{StaticResource SecondaryButton}"
-                    ToolTip="Abre la carpeta donde la aplicación guarda los archivos eliminados cuando la Papelera de Windows no está disponible.">
+                    Margin="0"
+                    ToolTip="Abre la carpeta donde la aplicación guarda copias eliminadas cuando la Papelera de Windows no está disponible.">
                 <StackPanel Orientation="Horizontal">
                     <TextBlock Text="{StaticResource IconFolder}"
                                FontFamily="{StaticResource IconFontFamily}"
-                               FontSize="14"
+                               FontSize="13"
                                Margin="0,0,7,0"
                                VerticalAlignment="Center" />
-                    <TextBlock Text="Abrir papelera de la aplicación" VerticalAlignment="Center" />
+                    <TextBlock Text="Abrir papelera de la aplicación" FontSize="{StaticResource FontSizeSmall}" VerticalAlignment="Center" />
                 </StackPanel>
             </Button>
+            <TextBlock Grid.Column="1"
+                       Text="Ctrl+O Carpeta · F5 Buscar · Ctrl+F Filtrar · Doble clic Abrir · Clic derecho Más acciones"
+                       Style="{StaticResource CaptionText}"
+                       HorizontalAlignment="Right"
+                       VerticalAlignment="Center" />
         </Grid>
     </Grid>
 </Window>

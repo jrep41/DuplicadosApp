@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Windows;
 using System.Windows.Documents;
 using System.Windows.Input;
@@ -13,50 +14,121 @@ public partial class MainWindow : Window
     private const int MaxLogChars = 512 * 1024;
 
     private readonly MainViewModel _viewModel;
+    private readonly Queue<int> _paragraphCharCounts = new();
 
-    /// <summary>Caracteres añadidos al registro, para no recalcular el texto entero.</summary>
     private int _logChars;
+    private Brush _logNormalBrush = Brushes.Black;
+    private Brush _logWarningBrush = Brushes.DarkOrange;
+    private Brush _logErrorBrush = Brushes.Crimson;
 
     public MainWindow()
     {
         InitializeComponent();
 
+        var initialDark = Application.Current is App app && app.IsDarkTheme;
+        RefreshLogBrushes();
+
         _viewModel = new MainViewModel(Dispatcher)
         {
+            IsDarkTheme = initialDark,
             ConfirmDelete = ConfirmDelete,
             ShowMessage = ShowMessage,
             OpenFolder = AbrirCarpeta,
             OpenFile = AbrirArchivoConAplicacionAsociada,
+            RevealFile = MostrarArchivoEnExplorador,
+            CopyText = CopiarAlPortapapeles,
+            ThemeChanged = OnThemeChanged,
         };
 
-        _viewModel.LogAppended += OnLogAppended;
+        _viewModel.LogsAppended += OnLogsAppended;
         _viewModel.LogCleared += OnLogCleared;
 
         DataContext = _viewModel;
+        SourceInitialized += (_, _) => App.ApplyWindowTitleBarTheme(this, _viewModel.IsDarkTheme);
     }
 
-    /// <summary>
-    /// Cancela la operación en curso al cerrar. Sin esto, la ventana desaparecía mientras
-    /// el hilo de fondo seguía recorriendo el disco y publicando avisos a un Dispatcher
-    /// ya apagado.
-    /// </summary>
     protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
     {
-        _viewModel.Cancel();
+        _viewModel.LogsAppended -= OnLogsAppended;
+        _viewModel.LogCleared -= OnLogCleared;
+        _viewModel.Dispose();
         base.OnClosing(e);
+    }
+
+    private void OnThemeChanged(bool isDark)
+    {
+        if (Application.Current is App app)
+        {
+            app.ApplyTheme(isDark);
+        }
+
+        RefreshLogBrushes();
+    }
+
+    private void RefreshLogBrushes()
+    {
+        _logNormalBrush = TryFindResource("TextPrimaryBrush") as Brush ?? Brushes.Black;
+        _logWarningBrush = TryFindResource("LogWarningBrush") as Brush ?? Brushes.DarkOrange;
+        _logErrorBrush = TryFindResource("LogErrorBrush") as Brush ?? Brushes.Crimson;
+    }
+
+    private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.F && (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control && _viewModel.HasResults)
+        {
+            SearchFilterBox.Focus();
+            SearchFilterBox.SelectAll();
+            e.Handled = true;
+        }
+    }
+
+    private void FolderPathBox_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter && _viewModel.StartSearchCommand.CanExecute(null))
+        {
+            e.Handled = true;
+            _viewModel.StartSearch();
+        }
+    }
+
+    private void Window_PreviewDragOver(object sender, DragEventArgs e)
+    {
+        if (!_viewModel.IsBusy && e.Data.GetDataPresent(DataFormats.FileDrop))
+        {
+            e.Effects = DragDropEffects.Copy;
+            e.Handled = true;
+        }
+        else
+        {
+            e.Effects = DragDropEffects.None;
+            e.Handled = true;
+        }
+    }
+
+    private void Window_Drop(object sender, DragEventArgs e)
+    {
+        if (_viewModel.IsBusy || !e.Data.GetDataPresent(DataFormats.FileDrop))
+        {
+            return;
+        }
+
+        if (e.Data.GetData(DataFormats.FileDrop) is string[] { Length: > 0 } paths)
+        {
+            _viewModel.TrySetFolderFromDrop(paths[0]);
+        }
     }
 
     private bool ConfirmDelete(DeletePrompt prompt)
     {
         var partes = new List<string>(4)
         {
-            $"Se enviarán {prompt.Count} archivo(s) a la papelera, donde podrás restaurarlos si te arrepientes.",
+            $"Se enviarán {prompt.Count:N0} archivo(s) ({FileItemViewModel.FormatSize(prompt.Bytes)}) a la papelera, donde podrás restaurarlos si te arrepientes.",
         };
 
         if (prompt.GroupsKept > 0)
         {
             partes.Add(
-                $"En {prompt.GroupsKept} grupo(s) has marcado todas las copias: se conservará la " +
+                $"En {prompt.GroupsKept:N0} grupo(s) has marcado todas las copias: se conservará la " +
                 "primera de cada uno para no quedarte sin ninguna.");
         }
 
@@ -70,22 +142,17 @@ public partial class MainWindow : Window
                    MessageBoxImage.Warning) == MessageBoxResult.Yes;
     }
 
-    /// <summary>
-    /// Muestra un mensaje y, cuando el usuario lo cierra, ejecuta la acción pendiente
-    /// (por ejemplo, abrir una carpeta). Así la ventana no queda detrás del diálogo.
-    /// </summary>
     private void ShowMessage(string title, string message, Action? alCerrar)
     {
         MessageBox.Show(this, message, title, MessageBoxButton.OK, MessageBoxImage.Information);
         alCerrar?.Invoke();
     }
 
-    /// <summary>Abre una carpeta en el Explorador de Windows.</summary>
     private void AbrirCarpeta(string ruta)
     {
         try
         {
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            Process.Start(new ProcessStartInfo
             {
                 FileName = "explorer.exe",
                 Arguments = $"\"{ruta}\"",
@@ -103,10 +170,40 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>
-    /// Abre con la aplicación asociada el archivo cuya ruta se ha pulsado dos veces.
-    /// Solo se atiende el segundo clic: el primero sigue sirviendo para seleccionar la fila.
-    /// </summary>
+    private void MostrarArchivoEnExplorador(string ruta)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "explorer.exe",
+                Arguments = $"/select,\"{ruta}\"",
+                UseShellExecute = false,
+            });
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            MessageBox.Show(
+                this,
+                $"No se pudo mostrar el archivo en el Explorador:\n\n{ex.Message}",
+                "Aviso",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+    }
+
+    private void CopiarAlPortapapeles(string texto)
+    {
+        try
+        {
+            Clipboard.SetText(texto);
+        }
+        catch (Exception ex) when (ex is System.Runtime.InteropServices.ExternalException)
+        {
+            // El portapapeles puede estar bloqueado momentáneamente por otra aplicación.
+        }
+    }
+
     private void RutaArchivo_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
         if (e.ClickCount != 2
@@ -115,23 +212,15 @@ public partial class MainWindow : Window
             return;
         }
 
-        // Se marca como atendido para que el doble clic no llegue a la lista y cambie la
-        // selección justo cuando se está abriendo el archivo.
         e.Handled = true;
         _viewModel.AbrirArchivo(item);
     }
 
-    /// <summary>
-    /// Lanza el archivo con el programa que Windows tenga asociado a su extensión. Con
-    /// UseShellExecute el propio shell decide el visor (fotos, reproductor, Word…), igual
-    /// que un doble clic en el Explorador. Si no hay asociación o el archivo se bloqueó,
-    /// se informa aquí: sin este control, el fallo cerraría la aplicación.
-    /// </summary>
     private void AbrirArchivoConAplicacionAsociada(string ruta)
     {
         try
         {
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            Process.Start(new ProcessStartInfo
             {
                 FileName = ruta,
                 UseShellExecute = true,
@@ -151,36 +240,37 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Añade un solo párrafo al final del registro, coloreado según su gravedad.
-    /// Esto es lo que evita que el registro cueste más cuanto más largo es: antes se
-    /// reconstruía todo el texto en cada línea.
+    /// Añade un lote de líneas al final del registro en una sola pasada y desplaza el scroll una vez.
     /// </summary>
-    private void OnLogAppended(object? sender, LogLine line)
+    private void OnLogsAppended(object? sender, IReadOnlyList<LogLine> lines)
     {
-        var brush = line.Severity switch
-        {
-            LogSeverity.Error => (Brush)FindResource("LogErrorBrush"),
-            LogSeverity.Warning => (Brush)FindResource("LogWarningBrush"),
-            _ => (Brush)FindResource("TextPrimaryBrush"),
-        };
-
         var documento = RegistroTexto.Document;
-        var parrafo = new Paragraph(new Run(line.Text))
-        {
-            Foreground = brush,
-            Margin = new Thickness(0),
-        };
 
-        // RichTextBox arranca con un párrafo vacío que hay que reaprovechar.
-        var vacio = documento.Blocks.Count == 1 && documento.Blocks.FirstBlock is Paragraph p
-            && string.IsNullOrEmpty(new TextRange(p.ContentStart, p.ContentEnd).Text);
-        if (vacio)
+        if (_paragraphCharCounts.Count == 0 && documento.Blocks.Count == 1)
         {
             documento.Blocks.Clear();
         }
 
-        documento.Blocks.Add(parrafo);
-        _logChars += line.Text.Length + 1;
+        foreach (var line in lines)
+        {
+            var brush = line.Severity switch
+            {
+                LogSeverity.Error => _logErrorBrush,
+                LogSeverity.Warning => _logWarningBrush,
+                _ => _logNormalBrush,
+            };
+
+            var parrafo = new Paragraph(new Run(line.Text))
+            {
+                Foreground = brush,
+                Margin = new Thickness(0),
+            };
+
+            documento.Blocks.Add(parrafo);
+            var len = line.Text.Length + 1;
+            _paragraphCharCounts.Enqueue(len);
+            _logChars += len;
+        }
 
         RecortarRegistro();
         RegistroTexto.ScrollToEnd();
@@ -189,13 +279,11 @@ public partial class MainWindow : Window
     private void OnLogCleared(object? sender, EventArgs e)
     {
         RegistroTexto.Document.Blocks.Clear();
+        _paragraphCharCounts.Clear();
         _logChars = 0;
     }
 
-    /// <summary>
-    /// Mantiene el registro acotado: cuando pasa del límite borra los párrafos más
-    /// antiguos (no todo el registro), de modo que la actividad reciente sigue visible.
-    /// </summary>
+    /// <summary>Recorta los párrafos más antiguos en O(1) por párrafo sin crear objetos TextRange.</summary>
     private void RecortarRegistro()
     {
         if (_logChars <= MaxLogChars)
@@ -204,18 +292,15 @@ public partial class MainWindow : Window
         }
 
         var documento = RegistroTexto.Document;
-        var aQuitar = Math.Max(1, documento.Blocks.Count / 2);
+        var aQuitar = Math.Max(1, _paragraphCharCounts.Count / 2);
         for (var i = 0; i < aQuitar; i++)
         {
-            if (documento.Blocks.FirstBlock is not { } primero)
+            if (documento.Blocks.FirstBlock is not { } primero || !_paragraphCharCounts.TryDequeue(out var len))
             {
                 break;
             }
 
-            // Se descuentan los caracteres reales del párrafo que se va. Antes se partía el
-            // contador por la mitad aunque se quitaran párrafos, no caracteres, así que el
-            // contador se desviaba y el límite de 512 KB dejaba de corresponder al texto.
-            _logChars -= new TextRange(primero.ContentStart, primero.ContentEnd).Text.Length + 1;
+            _logChars -= len;
             documento.Blocks.Remove(primero);
         }
 
