@@ -29,7 +29,6 @@ public sealed class MainViewModel : ObservableObject
     private double _progressValue;
     private bool _isProgressIndeterminate;
     private string _statusText = "Selecciona una carpeta para empezar.";
-    private bool _compareByteByByte;
     private bool _verbose = true;
     private bool _hasResults;
     private int _selectedCount;
@@ -122,6 +121,12 @@ public sealed class MainViewModel : ObservableObject
     public Action<string>? OpenFolder { get; set; }
 
     /// <summary>
+    /// Abre un archivo con la aplicación asociada a su extensión. La implementa la vista,
+    /// que es quien puede lanzar el proceso con el shell de Windows.
+    /// </summary>
+    public Action<string>? OpenFile { get; set; }
+
+    /// <summary>
     /// Carpeta de la papelera propia de la aplicación. Se usa cuando la Papelera de
     /// reciclaje de Windows no está disponible en el entorno.
     /// </summary>
@@ -168,12 +173,6 @@ public sealed class MainViewModel : ObservableObject
     }
 
     public bool HasFolder => !string.IsNullOrWhiteSpace(FolderPath);
-
-    public bool CompareByteByByte
-    {
-        get => _compareByteByByte;
-        set => SetProperty(ref _compareByteByByte, value);
-    }
 
     public bool Verbose
     {
@@ -517,7 +516,6 @@ public sealed class MainViewModel : ObservableObject
         ResetPhase();
 
         var folder = FolderPath;
-        var compareByteByByte = CompareByteByByte;
         _cancellation = new CancellationTokenSource();
         var token = _cancellation.Token;
 
@@ -534,7 +532,7 @@ public sealed class MainViewModel : ObservableObject
             ScanResult result;
             try
             {
-                result = finder.Run(folder, compareByteByByte);
+                result = finder.Run(folder);
             }
             catch (Exception ex)
             {
@@ -664,6 +662,29 @@ public sealed class MainViewModel : ObservableObject
         }
     }
 
+    /// <summary>
+    /// Abre una de las rutas listadas con la aplicación asociada a su extensión. Sirve para
+    /// comprobar el contenido de una copia antes de decidir cuál sobra; no toca la selección
+    /// ni el resultado de la búsqueda, así que se puede abrir y volver sin perder nada.
+    /// </summary>
+    public void AbrirArchivo(FileItemViewModel item)
+    {
+        // El archivo pudo desaparecer entre el escaneo y el doble clic (por ejemplo, porque
+        // se envió a la papelera). Se avisa aquí y no se delega al shell, cuyo mensaje
+        // ("El sistema no puede encontrar el archivo especificado") no dice qué ruta falla.
+        if (!File.Exists(item.Path))
+        {
+            ShowMessage?.Invoke(
+                "Aviso",
+                $"El archivo ya no está en su ruta:\n\n{item.Path}\n\n" +
+                "Es posible que se haya movido o enviado a la papelera desde otra ventana.",
+                null);
+            return;
+        }
+
+        OpenFile?.Invoke(item.Path);
+    }
+
     /// <summary>Abre en el Explorador la carpeta de la papelera propia.</summary>
     public void AbrirPapeleraPropia()
     {
@@ -761,11 +782,7 @@ public sealed class MainViewModel : ObservableObject
             return;
         }
 
-        // El aviso debe describir cómo se formaron REALMENTE los grupos que se van a
-        // borrar, no la casilla tal como está ahora: cambiarla después de buscar no vuelve a
-        // comparar nada, así que guiarse por ella silenciaría justo el aviso que importa.
-        var comparaContenido = aEnviar.TrueForAll(item => item.ComparedByteByByte);
-        if (ConfirmDelete?.Invoke(new DeletePrompt(aEnviar.Count, comparaContenido, conservar.Count)) != true)
+        if (ConfirmDelete?.Invoke(new DeletePrompt(aEnviar.Count, conservar.Count)) != true)
         {
             return;
         }
@@ -993,7 +1010,6 @@ public sealed class MainViewModel : ObservableObject
         ClearResults();
         ClearLog();
         FolderPath = string.Empty;
-        CompareByteByByte = false;
         Verbose = true;
         IsProgressIndeterminate = false;
         ProgressValue = 0;

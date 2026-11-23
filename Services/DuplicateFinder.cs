@@ -42,7 +42,7 @@ public sealed class DuplicateFinder
         _phase = phase ?? (_ => { });
     }
 
-    public ScanResult Run(string folder, bool compareByteByByte)
+    public ScanResult Run(string folder)
     {
         var result = new ScanResult();
         var stopwatch = Stopwatch.StartNew();
@@ -58,7 +58,7 @@ public sealed class DuplicateFinder
         Activity("Preparando el escaneo");
         Phase("Preparando el escaneo", 0, indeterminate: true);
         Log($"Iniciando búsqueda en: {folder}");
-        Log("Modo: " + (compareByteByByte ? "comparación byte a byte" : "nombre y tamaño"));
+        Log("Modo: mismo tamaño y misma extensión; el contenido se confirma byte a byte");
 
         var bySize = new Dictionary<long, List<FileEntry>>();
         var foldersSeen = 0;
@@ -132,8 +132,8 @@ public sealed class DuplicateFinder
                 : $"Tamaños agrupados: {bySize.Count} tamaños distintos, 0 archivos con error");
         var candidates = bySize.Where(pair => pair.Value.Count > 1).ToList();
         var totalGroups = candidates.Count;
-        var comparisonText = compareByteByByte ? "Comparando contenidos…" : "Agrupando por nombre…";
-        Log($"{totalGroups} tamaño(s) con más de un archivo; pasando a {comparisonText.TrimEnd('…').ToLowerInvariant()}");
+        const string comparisonText = "Comparando contenidos…";
+        Log($"{totalGroups} tamaño(s) con más de un archivo; comparando contenidos");
 
         var groups = new List<DuplicateGroup>();
         _errors = 0;
@@ -165,13 +165,25 @@ public sealed class DuplicateFinder
                         Interlocked.Increment(ref _entriesProcessed), totalEntries, phaseName);
 
                     var partial = new List<DuplicateGroup>();
-                    if (compareByteByByte)
+                    foreach (var sameExtension in GroupEntriesByExtension(entries))
                     {
-                        ConfirmByContent(size, entries, partial, OnFile);
-                    }
-                    else
-                    {
-                        ConfirmByName(size, entries, partial, OnFile);
+                        if (_isCancelled())
+                        {
+                            return;
+                        }
+
+                        if (sameExtension.Count < 2)
+                        {
+                            // Único archivo con esa extensión y ese tamaño: no hay nada que comparar.
+                            for (var i = 0; i < sameExtension.Count; i++)
+                            {
+                                OnFile();
+                            }
+
+                            continue;
+                        }
+
+                        ConfirmByContent(size, sameExtension, partial, OnFile);
                     }
 
                     if (partial.Count > 0)
@@ -245,8 +257,8 @@ public sealed class DuplicateFinder
                     return;
                 }
 
-                // En modo byte a byte la identidad ya se resolvió y verificó durante
-                // ConfirmByContent, evitando volver a abrir cada archivo en disco.
+                // La identidad ya se resolvió y verificó durante ConfirmByContent, así que
+                // no hace falta volver a abrir cada archivo en disco.
                 if (file.Identity != FileIdentity.Unknown)
                 {
                     resolved.Add(file);
@@ -276,72 +288,28 @@ public sealed class DuplicateFinder
         }
     }
 
-    private void ConfirmByName(
-        long size,
-        List<FileEntry> entries,
-        List<DuplicateGroup> groups,
-        Action onFile)
+    /// <summary>
+    /// Separa los candidatos de un mismo tamaño por extensión. La extensión se compara sin
+    /// distinguir mayúsculas y actúa como requisito: dos archivos de distinto tipo no pueden
+    /// ser el mismo archivo, así que no se gasta tiempo leyéndolos. El nombre no interviene,
+    /// porque dos copias pueden llamarse de forma distinta.
+    /// </summary>
+    private static IEnumerable<List<FileEntry>> GroupEntriesByExtension(List<FileEntry> entries)
     {
-        // Caso rápido: cuando solo hay 2 candidatos del mismo tamaño, se comparan sus
-        // nombres mediante ReadOnlySpan<char> sin alojar un Dictionary ni cadenas nuevas.
-        if (entries.Count == 2)
-        {
-            onFile();
-            onFile();
-            if (_isCancelled())
-            {
-                return;
-            }
-
-            var name0 = Path.GetFileName(entries[0].Path.AsSpan());
-            var name1 = Path.GetFileName(entries[1].Path.AsSpan());
-            if (name0.Equals(name1, StringComparison.OrdinalIgnoreCase))
-            {
-                groups.Add(new DuplicateGroup
-                {
-                    Size = size,
-                    DisplayName = Path.GetFileName(entries[0].Path),
-                    Files = entries,
-                    ComparedByteByByte = false,
-                });
-            }
-
-            return;
-        }
-
-        var byName = new Dictionary<string, List<FileEntry>>(StringComparer.OrdinalIgnoreCase);
+        var byExtension = new Dictionary<string, List<FileEntry>>(StringComparer.OrdinalIgnoreCase);
         foreach (var entry in entries)
         {
-            onFile();
-
-            if (_isCancelled())
-            {
-                return;
-            }
-
-            var name = Path.GetFileName(entry.Path);
-            if (!byName.TryGetValue(name, out var list))
+            var extension = Path.GetExtension(entry.Path);
+            if (!byExtension.TryGetValue(extension, out var list))
             {
                 list = [];
-                byName[name] = list;
+                byExtension[extension] = list;
             }
 
             list.Add(entry);
         }
 
-        foreach (var (name, group) in byName)
-        {
-            if (group.Count > 1)
-            {
-                groups.Add(new DuplicateGroup
-                {
-                    Size = size,
-                    DisplayName = name,
-                    Files = group,
-                    ComparedByteByByte = false,
-                });
-            }
-        }
+        return byExtension.Values;
     }
 
     /// <summary>
@@ -469,7 +437,6 @@ public sealed class DuplicateFinder
                         Size = size,
                         DisplayName = Path.GetFileName(subGroup[0].Path),
                         Files = subGroup,
-                        ComparedByteByByte = true,
                     });
                 }
             }

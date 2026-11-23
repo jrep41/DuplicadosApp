@@ -114,21 +114,30 @@
                                MaxWidth="620" />
                 </StackPanel>
 
-                <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,12,0,0">
-                    <CheckBox Content="Comparar byte a byte (desmarcado: nombre y tamaño)"
-                              Style="{StaticResource AppCheckBox}"
-                              IsChecked="{Binding CompareByteByByte}"
-                              IsEnabled="{Binding IsIdle}"
-                              VerticalAlignment="Center"
-                              ToolTip="Al marcar, compara el contenido de los archivos byte a byte para confirmar que son idénticos (más preciso pero más lento). Al desmarcar, solo compara el nombre y el tamaño."
-                              ToolTipService.ShowOnDisabled="True" />
-                    <CheckBox Content="Modo detallado"
+                <!--
+                    El criterio es único (tamaño + extensión + contenido), así que ya no hay
+                    casilla de modo: la fila ocupa el ancho disponible para que la descripción
+                    se ajuste en lugar de recortarse.
+                -->
+                <Grid Grid.Row="1" Margin="0,12,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <CheckBox Grid.Column="0"
+                              Content="Modo detallado"
                               Style="{StaticResource AppCheckBox}"
                               IsChecked="{Binding Verbose}"
-                              Margin="26,0,0,0"
                               VerticalAlignment="Center"
                               ToolTip="Al marcar, escribe información detallada del proceso y el latido de estado en el registro de actividad. Al desmarcar, pausa la escritura de nuevas líneas en el registro." />
-                </StackPanel>
+                    <TextBlock Grid.Column="1"
+                               Text="Criterio: mismo tamaño y misma extensión, también en todas las subcarpetas. Solo esas coincidencias se comparan después byte a byte."
+                               Style="{StaticResource MutedText}"
+                               Margin="26,0,0,0"
+                               TextWrapping="Wrap"
+                               VerticalAlignment="Center"
+                               ToolTip="Los nombres no tienen por qué coincidir: dos copias pueden llamarse distinto. El contenido solo se compara cuando el tamaño y la extensión coinciden." />
+                </Grid>
             </Grid>
         </Border>
 
@@ -270,7 +279,26 @@
                                                            Text="{Binding Path}"
                                                            Margin="8,0,10,0"
                                                            TextWrapping="Wrap"
-                                                           ToolTip="{Binding Path}" />
+                                                           Cursor="Hand"
+                                                           ToolTip="{Binding Path}"
+                                                           MouseLeftButtonDown="RutaArchivo_MouseLeftButtonDown">
+                                                    <!--
+                                                        El doble clic se engancha en la ruta y no en
+                                                        la fila: así la casilla de selección sigue
+                                                        marcando y desmarcando sin abrir el archivo.
+                                                        El resaltado al pasar el ratón avisa de que
+                                                        la línea es pulsable.
+                                                    -->
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock">
+                                                            <Style.Triggers>
+                                                                <Trigger Property="IsMouseOver" Value="True">
+                                                                    <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+                                                                </Trigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                </TextBlock>
                                                 <TextBlock Grid.Column="2"
                                                            Text="{Binding SizeText}"
                                                            VerticalAlignment="Center"

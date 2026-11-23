@@ -25,8 +25,6 @@ public sealed class FileItemViewModel : ObservableObject
     /// <summary>Grupo al que pertenece el archivo (la plantilla lo usa para la cabecera).</summary>
     public DuplicateGroupViewModel Group { get; }
 
-    public bool ComparedByteByByte => Group.ComparedByteByByte;
-
     public string Path => Entry.Path;
 
     public long Size => Entry.Size;
@@ -51,10 +49,8 @@ public sealed class FileItemViewModel : ObservableObject
     public DeleteCandidate ToCandidate() => new(
         Entry.Path,
         Entry.Size,
-        Name,
         Entry.Identity,
-        Group.Index,
-        Group.ComparedByteByByte);
+        Group.Index);
 
     public static string FormatSize(long bytes)
     {

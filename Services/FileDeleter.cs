@@ -137,14 +137,10 @@ public sealed class FileDeleter
                         continue;
                     }
 
-                    var contentValid = item.ComparedByteByByte
-                        ? HasMatchingSibling(item, candidatesByGroup)
-                        : string.Equals(
-                            Path.GetFileName(item.Path),
-                            item.Name,
-                            StringComparison.OrdinalIgnoreCase);
-
-                    if (!contentValid || !FileSystemService.MatchesIdentity(item.Path, item.Identity, item.Size))
+                    // Solo se envía a la papelera si algún hermano del grupo sigue teniendo el
+                    // mismo contenido: así nunca se pierde la última copia buena.
+                    if (!HasMatchingSibling(item, candidatesByGroup)
+                        || !FileSystemService.MatchesIdentity(item.Path, item.Identity, item.Size))
                     {
                         outcome.Errors++;
                         continue;
@@ -238,9 +234,7 @@ public sealed class FileDeleter
                 return false;
             }
 
-            if (other.Path == item.Path ||
-                !other.ComparedByteByByte ||
-                other.Size != item.Size)
+            if (other.Path == item.Path || other.Size != item.Size)
             {
                 continue;
             }

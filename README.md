@@ -114,7 +114,8 @@ archivos que ya no existen se retiran de la lista aunque el borrado se cancele a
 - **Seleccionar carpeta**: elige la ruta donde buscar. Al elegir una carpeta nueva,
   vacía el panel de actividad y devuelve las dos barras de progreso al reposo (0 %),
   para no mezclar el resultado anterior con la búsqueda que se va a lanzar.
-- **Comparar byte a byte**: activa la comparación por contenido.
+- **Criterio de búsqueda**: no hay modos que elegir. Siempre se agrupa por tamaño y por
+  extensión, y solo esos candidatos se comparan después byte a byte.
 - **Modo detallado**: muestra u oculta el panel de actividad.
 - **Buscar duplicados**: inicia el escaneo en segundo plano.
 - **Seleccionar copias (automático)**: marca todas las copias dejando el primer
@@ -126,6 +127,10 @@ archivos que ya no existen se retiran de la lista aunque el borrado se cancele a
   identidad), así que no hay que esperar a que termine la fase en curso.
 - **Eliminar archivos seleccionados**: envía los archivos marcados a la papelera tras
   confirmar.
+- **Doble clic en la ruta de un archivo**: abre el archivo con la aplicación asociada a
+  su extensión (el mismo programa que abriría el Explorador), para poder ver qué contiene
+  antes de decidir qué copia se conserva. El doble clic sobre la casilla de selección no
+  abre nada: solo marca o desmarca el archivo.
 - **Abrir papelera de la aplicación**: abre la carpeta donde se guardan los archivos
   cuando la Papelera de Windows no está disponible.
 

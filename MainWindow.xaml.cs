@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Documents;
+using System.Windows.Input;
 using System.Windows.Media;
 using DuplicadosApp.Models;
 using DuplicadosApp.ViewModels;
@@ -25,6 +26,7 @@ public partial class MainWindow : Window
             ConfirmDelete = ConfirmDelete,
             ShowMessage = ShowMessage,
             OpenFolder = AbrirCarpeta,
+            OpenFile = AbrirArchivoConAplicacionAsociada,
         };
 
         _viewModel.LogAppended += OnLogAppended;
@@ -50,16 +52,6 @@ public partial class MainWindow : Window
         {
             $"Se enviarán {prompt.Count} archivo(s) a la papelera, donde podrás restaurarlos si te arrepientes.",
         };
-
-        // En el modo «nombre y tamaño» no se ha comparado el contenido: dos archivos
-        // distintos pueden coincidir en nombre y tamaño. Se avisa aquí, que es el último
-        // punto en el que el usuario puede echarse atrás.
-        if (!prompt.ComparesContent)
-        {
-            partes.Add(
-                "Estás en el modo «nombre y tamaño»: los archivos se agruparon solo por nombre y " +
-                "tamaño, sin comparar su contenido. Dos archivos distintos pueden coincidir en ambos.");
-        }
 
         if (prompt.GroupsKept > 0)
         {
@@ -105,6 +97,53 @@ public partial class MainWindow : Window
             MessageBox.Show(
                 this,
                 $"No se pudo abrir la carpeta:\n\n{ex.Message}",
+                "Aviso",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+    }
+
+    /// <summary>
+    /// Abre con la aplicación asociada el archivo cuya ruta se ha pulsado dos veces.
+    /// Solo se atiende el segundo clic: el primero sigue sirviendo para seleccionar la fila.
+    /// </summary>
+    private void RutaArchivo_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ClickCount != 2
+            || sender is not FrameworkElement { DataContext: FileItemViewModel item })
+        {
+            return;
+        }
+
+        // Se marca como atendido para que el doble clic no llegue a la lista y cambie la
+        // selección justo cuando se está abriendo el archivo.
+        e.Handled = true;
+        _viewModel.AbrirArchivo(item);
+    }
+
+    /// <summary>
+    /// Lanza el archivo con el programa que Windows tenga asociado a su extensión. Con
+    /// UseShellExecute el propio shell decide el visor (fotos, reproductor, Word…), igual
+    /// que un doble clic en el Explorador. Si no hay asociación o el archivo se bloqueó,
+    /// se informa aquí: sin este control, el fallo cerraría la aplicación.
+    /// </summary>
+    private void AbrirArchivoConAplicacionAsociada(string ruta)
+    {
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = ruta,
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception
+                                       or InvalidOperationException
+                                       or System.IO.FileNotFoundException)
+        {
+            MessageBox.Show(
+                this,
+                $"No se pudo abrir el archivo:\n\n{ruta}\n\n{ex.Message}",
                 "Aviso",
                 MessageBoxButton.OK,
                 MessageBoxImage.Warning);

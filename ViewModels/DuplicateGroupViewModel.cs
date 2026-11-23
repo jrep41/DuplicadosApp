@@ -16,7 +16,6 @@ public sealed class DuplicateGroupViewModel : ObservableObject
     {
         Index = index;
         Size = group.Size;
-        ComparedByteByByte = group.ComparedByteByByte;
         DisplayName = group.DisplayName;
         SizeText = FileItemViewModel.FormatSize(group.Size);
         Header = $"Grupo de duplicados {index + 1}: {group.DisplayName}";
@@ -35,8 +34,6 @@ public sealed class DuplicateGroupViewModel : ObservableObject
     public long Size { get; }
 
     public string SizeText { get; }
-
-    public bool ComparedByteByByte { get; }
 
     public string DisplayName { get; }
 

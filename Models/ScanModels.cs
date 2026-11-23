@@ -12,9 +12,6 @@ public sealed class DuplicateGroup
     public required string DisplayName { get; init; }
 
     public required IReadOnlyList<FileEntry> Files { get; set; }
-
-    /// <summary>True si el grupo se formó comparando contenido byte a byte.</summary>
-    public bool ComparedByteByByte { get; init; }
 }
 
 /// <summary>
@@ -43,10 +40,8 @@ public sealed class ScanResult
 public sealed record DeleteCandidate(
     string Path,
     long Size,
-    string Name,
     FileIdentity Identity,
-    int GroupIndex,
-    bool ComparedByteByByte);
+    int GroupIndex);
 
 /// <summary>Dónde acabó un archivo al borrarlo.</summary>
 public enum DeleteDestination
@@ -62,9 +57,8 @@ public enum DeleteDestination
 /// Datos que la vista necesita para redactar la confirmación de un borrado.
 /// </summary>
 /// <param name="Count">Archivos que se van a enviar a la papelera.</param>
-/// <param name="ComparesContent">True si el grupo se formó comparando contenido byte a byte.</param>
 /// <param name="GroupsKept">Grupos en los que se marcaron todas las copias y se conserva una.</param>
-public sealed record DeletePrompt(int Count, bool ComparesContent, int GroupsKept);
+public sealed record DeletePrompt(int Count, int GroupsKept);
 
 /// <summary>Resultado de un borrado.</summary>
 public sealed class DeleteOutcome
